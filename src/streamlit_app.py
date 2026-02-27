@@ -1,0 +1,1215 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Yamamoto Yota
+
+"""Streamlit UI for the DataStitcher MVP."""
+
+from __future__ import annotations
+
+import traceback
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Iterable
+
+import pandas as pd
+import streamlit as st
+
+from .column_match import suggest_union_column_mapping
+from .errors import DataStitcherError, UserInputError
+from .io_utils import detect_csv_options, list_excel_sheets, load_table as load_table_bytes, read_raw_table, sha256_hex
+from .join_engine import PandasEquiJoinEngine, execute_join_plan
+from .models import (
+    UNION_DROP,
+    UNION_KEEP_AS_NEW,
+    CSVOptions,
+    ExecutionLogEntry,
+    JoinPlan,
+    JoinStep,
+    OutputSettings,
+    Recipe,
+    TableConfig,
+)
+from .profile import profile_dataframe
+from .recipe import build_recipe, recipe_from_json, recipe_to_json
+from .report import EXCEL_MAX_ROWS, append_execution_log, dataframe_to_csv_bytes, dataframe_to_excel_bytes
+
+PREVIEW_ROWS_DEFAULT = 100
+PREVIEW_PLAN_ROWS = 200
+LOG_PATH = Path("logs") / "execution_log.jsonl"
+
+CSV_ENCODING_OPTIONS = ["auto", "utf-8", "utf-8-sig", "cp932", "shift_jis", "latin1"]
+CSV_DELIMITER_OPTIONS = ["auto", ",", "\t", ";", "|"]
+CSV_QUOTE_OPTIONS = ["auto", '"', "'", "none"]
+DTYPE_OVERRIDE_OPTIONS = ["auto", "string", "number", "datetime"]
+JOIN_TYPE_OPTIONS = ["inner", "left", "right", "outer"]
+CONFLICT_POLICY_OPTIONS = ["left_prefer", "right_prefer", "keep_both"]
+STEP_OPERATION_OPTIONS = ["join", "union"]
+JOIN_ALGORITHM_OPTIONS = ["equi", "asof"]
+ASOF_DIRECTION_OPTIONS = ["backward", "forward", "nearest"]
+UNION_MAPPING_SPECIAL_OPTIONS = [UNION_KEEP_AS_NEW, UNION_DROP]
+
+
+def _rerun() -> None:
+    """Trigger a Streamlit rerun (compatible with multiple Streamlit versions)."""
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:  # pragma: no cover - compatibility branch
+        st.experimental_rerun()
+
+
+def _short_hash(text: str) -> str:
+    return text[:10]
+
+
+def _safe_table_id(file_hash: str) -> str:
+    return f"tbl_{_short_hash(file_hash)}"
+
+
+def _safe_step_id(index_hint: int) -> str:
+    return f"step_{index_hint+1}"
+
+
+def init_session_state() -> None:
+    """Initialize all app session state keys used by the UI."""
+    defaults: dict[str, Any] = {
+        "table_configs": {},
+        "join_plan": {"base_table_id": "", "row_explosion_warn_ratio": 10.0, "steps": []},
+        "output_settings": {
+            "default_format": "csv",
+            "csv_encoding": "utf-8-sig",
+            "excel_sheet_name": "result",
+        },
+        "preview_rows": PREVIEW_ROWS_DEFAULT,
+        "last_execution": None,
+        "recipe_import_message": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
+def _table_kind_from_filename(name: str) -> str:
+    lower = name.lower()
+    if lower.endswith(".csv"):
+        return "csv"
+    if lower.endswith(".xlsx"):
+        return "excel"
+    raise UserInputError(f"未対応ファイル形式です: {name} (CSV / XLSX のみ)")
+
+
+def _table_label(table_id: str, table_cfgs: dict[str, dict[str, Any]], uploaded_map: dict[str, dict[str, Any]]) -> str:
+    cfg = table_cfgs.get(table_id, {})
+    display_name = str(cfg.get("table_name", table_id))
+    file_name = str(cfg.get("source_file_name", ""))
+    missing = table_id not in uploaded_map
+    suffix = " (未アップロード)" if missing else ""
+    return f"{display_name} [{file_name}]{suffix}"
+
+
+def _ensure_join_plan_shape() -> None:
+    """Normalize the in-session join plan dictionary."""
+    plan = st.session_state["join_plan"]
+    plan.setdefault("base_table_id", "")
+    plan.setdefault("row_explosion_warn_ratio", 10.0)
+    plan.setdefault("steps", [])
+    if not isinstance(plan["steps"], list):
+        plan["steps"] = []
+    for idx, step in enumerate(plan["steps"]):
+        step.setdefault("step_id", _safe_step_id(idx))
+        step.setdefault("right_table_id", "")
+        step.setdefault("operation", "join")
+        step.setdefault("join_algorithm", "equi")
+        step.setdefault("join_type", "left")
+        step.setdefault("left_keys", [])
+        step.setdefault("right_keys", [])
+        step.setdefault("left_by_keys", [])
+        step.setdefault("right_by_keys", [])
+        step.setdefault("asof_direction", "backward")
+        step.setdefault("asof_tolerance", "")
+        step.setdefault("asof_allow_exact_matches", True)
+        step.setdefault("conflict_policy", "keep_both")
+        step.setdefault("suffixes", ["_l", "_r"])
+        step.setdefault("union_column_mapping", {})
+        step.setdefault("union_right_column_suffix", "_u")
+        step.setdefault("union_add_source_column", False)
+        step.setdefault("union_source_column_name", "_source_table")
+        step.setdefault("union_source_value", "")
+        if not isinstance(step["suffixes"], list) or len(step["suffixes"]) != 2:
+            step["suffixes"] = ["_l", "_r"]
+        if not isinstance(step["left_keys"], list):
+            step["left_keys"] = []
+        if not isinstance(step["right_keys"], list):
+            step["right_keys"] = []
+        if not isinstance(step["left_by_keys"], list):
+            step["left_by_keys"] = []
+        if not isinstance(step["right_by_keys"], list):
+            step["right_by_keys"] = []
+        if not isinstance(step["union_column_mapping"], dict):
+            step["union_column_mapping"] = {}
+
+
+def _update_table_config_in_state(cfg: TableConfig) -> None:
+    st.session_state["table_configs"][cfg.table_id] = cfg.to_dict()
+
+
+def _sync_uploaded_files(uploaded_files: Iterable[Any]) -> dict[str, dict[str, Any]]:
+    """Sync Streamlit uploaded files with session table configs and return an in-memory file map."""
+    uploaded_map: dict[str, dict[str, Any]] = {}
+    table_cfgs: dict[str, dict[str, Any]] = st.session_state["table_configs"]
+
+    hash_to_existing_id: dict[str, str] = {}
+    for tid, raw_cfg in table_cfgs.items():
+        file_hash = raw_cfg.get("file_hash")
+        if isinstance(file_hash, str) and file_hash:
+            hash_to_existing_id[file_hash] = tid
+
+    for uploaded in uploaded_files:
+        data = uploaded.getvalue()
+        file_hash = sha256_hex(data)
+        source_kind = _table_kind_from_filename(uploaded.name)
+        table_id = hash_to_existing_id.get(file_hash, _safe_table_id(file_hash))
+
+        uploaded_map[table_id] = {
+            "table_id": table_id,
+            "name": uploaded.name,
+            "kind": source_kind,
+            "bytes": data,
+            "sha256": file_hash,
+        }
+
+        existing_cfg = table_cfgs.get(table_id)
+        if existing_cfg:
+            cfg = TableConfig.from_dict(existing_cfg)
+            cfg.source_file_name = uploaded.name
+            cfg.source_kind = source_kind  # type: ignore[assignment]
+            cfg.file_hash = file_hash
+        else:
+            cfg = TableConfig(
+                table_id=table_id,
+                table_name=Path(uploaded.name).stem,
+                source_file_name=uploaded.name,
+                source_kind=source_kind,  # type: ignore[arg-type]
+                file_hash=file_hash,
+            )
+            if source_kind == "csv":
+                try:
+                    cfg.csv_options = detect_csv_options(data)
+                except Exception:
+                    cfg.csv_options = CSVOptions()
+            else:
+                try:
+                    sheets = list_excel_sheets(data)
+                    if sheets:
+                        cfg.excel_options.sheet_name = sheets[0]
+                except Exception:
+                    pass
+            _update_table_config_in_state(cfg)
+
+    _ensure_join_plan_shape()
+    _reconcile_plan_with_table_configs(uploaded_map)
+    return uploaded_map
+
+
+def _reconcile_plan_with_table_configs(uploaded_map: dict[str, dict[str, Any]]) -> None:
+    """Keep base table and step table references valid when tables are added/removed."""
+    table_cfgs = st.session_state["table_configs"]
+    table_ids = list(table_cfgs.keys())
+    if not table_ids:
+        st.session_state["join_plan"]["base_table_id"] = ""
+        st.session_state["join_plan"]["steps"] = []
+        return
+
+    plan = st.session_state["join_plan"]
+    if plan["base_table_id"] not in table_cfgs:
+        plan["base_table_id"] = table_ids[0]
+
+    for step in plan["steps"]:
+        if step.get("right_table_id") not in table_cfgs:
+            step["right_table_id"] = ""
+
+
+def _make_new_step(default_right_table_id: str = "") -> dict[str, Any]:
+    idx = len(st.session_state["join_plan"]["steps"])
+    return {
+        "step_id": _safe_step_id(idx),
+        "right_table_id": default_right_table_id,
+        "operation": "join",
+        "join_algorithm": "equi",
+        "join_type": "left",
+        "left_keys": [],
+        "right_keys": [],
+        "left_by_keys": [],
+        "right_by_keys": [],
+        "asof_direction": "backward",
+        "asof_tolerance": "",
+        "asof_allow_exact_matches": True,
+        "conflict_policy": "keep_both",
+        "suffixes": ["_l", "_r"],
+        "union_column_mapping": {},
+        "union_right_column_suffix": "_u",
+        "union_add_source_column": False,
+        "union_source_column_name": "_source_table",
+        "union_source_value": "",
+    }
+
+
+def _get_table_configs_models() -> list[TableConfig]:
+    return [TableConfig.from_dict(v) for v in st.session_state["table_configs"].values()]
+
+
+def _get_join_plan_model() -> JoinPlan:
+    _ensure_join_plan_shape()
+    plan = st.session_state["join_plan"]
+    return JoinPlan(
+        base_table_id=str(plan.get("base_table_id", "")),
+        row_explosion_warn_ratio=float(plan.get("row_explosion_warn_ratio", 10.0)),
+        steps=[JoinStep.from_dict(step) for step in plan.get("steps", [])],
+    )
+
+
+def _get_output_settings_model() -> OutputSettings:
+    settings = st.session_state["output_settings"]
+    return OutputSettings.from_dict(settings)
+
+
+def _current_recipe() -> Recipe:
+    """Build a Recipe object from current state (validates structure)."""
+    return build_recipe(
+        tables=_get_table_configs_models(),
+        join_plan=_get_join_plan_model(),
+        output_settings=_get_output_settings_model(),
+        ui_settings={
+            "preview_rows": int(st.session_state["preview_rows"]),
+            "row_explosion_warn_ratio": float(st.session_state["join_plan"]["row_explosion_warn_ratio"]),
+        },
+    )
+
+
+def _apply_recipe_to_state(recipe: Recipe) -> None:
+    """Apply a loaded recipe to Streamlit session state."""
+    table_cfgs: dict[str, dict[str, Any]] = st.session_state["table_configs"]
+    incoming_by_id = {t.table_id: t for t in recipe.tables}
+
+    # Merge by table_id first; keep already uploaded file hash/filename if the file is currently present.
+    for table_id, incoming in incoming_by_id.items():
+        existing = table_cfgs.get(table_id)
+        if existing:
+            merged = TableConfig.from_dict(incoming.to_dict())
+            existing_cfg = TableConfig.from_dict(existing)
+            if existing_cfg.file_hash:
+                merged.file_hash = existing_cfg.file_hash
+            if existing_cfg.source_file_name:
+                merged.source_file_name = existing_cfg.source_file_name
+            if existing_cfg.source_kind:
+                merged.source_kind = existing_cfg.source_kind
+            table_cfgs[table_id] = merged.to_dict()
+        else:
+            table_cfgs[table_id] = incoming.to_dict()
+
+    st.session_state["join_plan"] = recipe.join_plan.to_dict()
+    st.session_state["output_settings"] = recipe.output_settings.to_dict()
+    if "preview_rows" in recipe.ui_settings:
+        try:
+            st.session_state["preview_rows"] = max(10, int(recipe.ui_settings["preview_rows"]))
+        except Exception:
+            pass
+    _ensure_join_plan_shape()
+
+
+def _show_exception(title: str, exc: Exception) -> None:
+    """Render a user-friendly error with traceback details in an expander."""
+    st.error(f"{title}: {exc}")
+    with st.expander("詳細エラー情報", expanded=False):
+        st.code(traceback.format_exc())
+
+
+def _sanitize_columns_for_table(cfg: TableConfig, available_columns: list[str]) -> TableConfig:
+    """Drop stale selected columns/dtype overrides after parsing option changes."""
+    available_set = set(available_columns)
+    if cfg.selected_columns:
+        cfg.selected_columns = [c for c in cfg.selected_columns if c in available_set]
+    cfg.dtype_overrides = {k: v for k, v in cfg.dtype_overrides.items() if k in available_set}
+    return cfg
+
+
+def _render_table_management(
+    uploaded_map: dict[str, dict[str, Any]]
+) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    """Render table configuration UI and return prepared preview tables."""
+    table_cfgs = st.session_state["table_configs"]
+    previews: dict[str, pd.DataFrame] = {}
+    preview_errors: dict[str, str] = {}
+    preview_rows = int(st.session_state["preview_rows"])
+
+    st.subheader("入力テーブル")
+    if not table_cfgs:
+        st.info("サイドバーから CSV / Excel ファイルをアップロードしてください。")
+        return previews, preview_errors
+
+    for idx, table_id in enumerate(sorted(table_cfgs.keys())):
+        cfg = TableConfig.from_dict(table_cfgs[table_id])
+        uploaded = uploaded_map.get(table_id)
+        status = "アップロード済み" if uploaded else "未アップロード"
+        with st.expander(f"{cfg.table_name} ({cfg.source_file_name}) - {status}", expanded=idx == 0):
+            cfg.table_name = st.text_input(
+                "テーブル名",
+                value=cfg.table_name,
+                key=f"table_name_{table_id}",
+            )
+            cfg.normalize_columns = st.checkbox(
+                "列名を正規化（前後空白除去 + NFKC）",
+                value=cfg.normalize_columns,
+                key=f"normalize_columns_{table_id}",
+            )
+
+            if not uploaded:
+                st.warning("このテーブルに対応するファイルが現在アップロードされていません。レシピから読み込んだ可能性があります。")
+                _update_table_config_in_state(cfg)
+                continue
+
+            raw_bytes = uploaded["bytes"]
+
+            if cfg.source_kind == "csv":
+                detected = detect_csv_options(raw_bytes)
+                csv_col1, csv_col2 = st.columns(2)
+                with csv_col1:
+                    cfg.csv_options.encoding = st.selectbox(
+                        "文字コード",
+                        options=CSV_ENCODING_OPTIONS,
+                        index=CSV_ENCODING_OPTIONS.index(cfg.csv_options.encoding)
+                        if cfg.csv_options.encoding in CSV_ENCODING_OPTIONS
+                        else 0,
+                        key=f"csv_encoding_{table_id}",
+                        help=f"auto推定: {detected.encoding}",
+                    )
+                    cfg.csv_options.delimiter = st.selectbox(
+                        "区切り文字",
+                        options=CSV_DELIMITER_OPTIONS,
+                        index=CSV_DELIMITER_OPTIONS.index(cfg.csv_options.delimiter)
+                        if cfg.csv_options.delimiter in CSV_DELIMITER_OPTIONS
+                        else 0,
+                        key=f"csv_delimiter_{table_id}",
+                        format_func=lambda x: {"\t": "\\t", ",": ",", ";": ";", "|": "|", "auto": "auto"}.get(x, x),
+                        help=f"auto推定: {repr(detected.delimiter)}",
+                    )
+                with csv_col2:
+                    cfg.csv_options.quotechar = st.selectbox(
+                        "引用符",
+                        options=CSV_QUOTE_OPTIONS,
+                        index=CSV_QUOTE_OPTIONS.index(cfg.csv_options.quotechar)
+                        if cfg.csv_options.quotechar in CSV_QUOTE_OPTIONS
+                        else 0,
+                        key=f"csv_quotechar_{table_id}",
+                        help=f"auto推定: {repr(detected.quotechar)}",
+                    )
+                    cfg.csv_options.header_row = int(
+                        st.number_input(
+                            "ヘッダ行 (1始まり)",
+                            min_value=1,
+                            step=1,
+                            value=int(cfg.csv_options.header_row or 1),
+                            key=f"csv_header_row_{table_id}",
+                        )
+                    )
+            else:
+                try:
+                    sheet_names = list_excel_sheets(raw_bytes)
+                except Exception as exc:
+                    preview_errors[table_id] = str(exc)
+                    _show_exception(f"Excel設定読み込みエラー ({cfg.table_name})", exc if isinstance(exc, Exception) else Exception(str(exc)))
+                    _update_table_config_in_state(cfg)
+                    continue
+                if not sheet_names:
+                    preview_errors[table_id] = "Excelにシートがありません。"
+                    st.error("Excelにシートがありません。")
+                    _update_table_config_in_state(cfg)
+                    continue
+                if cfg.excel_options.sheet_name not in sheet_names:
+                    cfg.excel_options.sheet_name = sheet_names[0]
+                excel_col1, excel_col2 = st.columns(2)
+                with excel_col1:
+                    cfg.excel_options.sheet_name = st.selectbox(
+                        "シート選択",
+                        options=sheet_names,
+                        index=sheet_names.index(cfg.excel_options.sheet_name) if cfg.excel_options.sheet_name in sheet_names else 0,
+                        key=f"excel_sheet_{table_id}",
+                    )
+                with excel_col2:
+                    cfg.excel_options.header_row = int(
+                        st.number_input(
+                            "ヘッダ行 (1始まり)",
+                            min_value=1,
+                            step=1,
+                            value=int(cfg.excel_options.header_row or 1),
+                            key=f"excel_header_row_{table_id}",
+                        )
+                    )
+
+            try:
+                raw_preview = read_raw_table(raw_bytes, cfg, nrows=preview_rows)
+                # Build a temporary preview to derive column candidates before selection is applied.
+                temp_cfg = TableConfig.from_dict(cfg.to_dict())
+                temp_cfg.selected_columns = []
+                normalized_preview = load_table_bytes(raw_bytes, temp_cfg, nrows=preview_rows)
+                all_columns = [str(c) for c in normalized_preview.columns]
+                cfg = _sanitize_columns_for_table(cfg, all_columns)
+                if not cfg.selected_columns:
+                    cfg.selected_columns = all_columns.copy()
+
+                col_sel = st.multiselect(
+                    "使用する列",
+                    options=all_columns,
+                    default=[c for c in cfg.selected_columns if c in all_columns],
+                    key=f"selected_columns_{table_id}",
+                )
+                cfg.selected_columns = list(col_sel)
+
+                profile_df = profile_dataframe(normalized_preview)
+                st.caption("型推定（プレビュー基準）")
+                st.dataframe(profile_df, use_container_width=True, height=220)
+
+                with st.expander("型上書き（列ごと）", expanded=False):
+                    inferred_map = {
+                        str(row["column"]): str(row["inferred_type"])
+                        for _, row in profile_df.iterrows()
+                    }
+                    for col_name in all_columns:
+                        col_a, col_b = st.columns([3, 2])
+                        with col_a:
+                            st.text(f"{col_name} (推定: {inferred_map.get(col_name, 'string')})")
+                        with col_b:
+                            current_override = cfg.dtype_overrides.get(col_name, "auto")
+                            selected_override = st.selectbox(
+                                "型",
+                                options=DTYPE_OVERRIDE_OPTIONS,
+                                index=DTYPE_OVERRIDE_OPTIONS.index(current_override)
+                                if current_override in DTYPE_OVERRIDE_OPTIONS
+                                else 0,
+                                key=f"dtype_override_{table_id}_{col_name}",
+                                label_visibility="collapsed",
+                            )
+                            if selected_override == "auto":
+                                cfg.dtype_overrides.pop(col_name, None)
+                            else:
+                                cfg.dtype_overrides[col_name] = selected_override  # type: ignore[assignment]
+
+                prepared_preview = load_table_bytes(raw_bytes, cfg, nrows=preview_rows)
+                previews[table_id] = prepared_preview
+                st.caption(f"プレビュー（先頭 {preview_rows} 行）: {prepared_preview.shape[0]} 行 x {prepared_preview.shape[1]} 列")
+                st.dataframe(prepared_preview.head(preview_rows), use_container_width=True, height=300)
+            except Exception as exc:
+                preview_errors[table_id] = str(exc)
+                _show_exception(f"プレビュー読み込みエラー ({cfg.table_name})", exc if isinstance(exc, Exception) else Exception(str(exc)))
+
+            _update_table_config_in_state(cfg)
+
+    return previews, preview_errors
+
+
+def _move_step(index: int, direction: int) -> None:
+    """Move a join step up/down in the plan."""
+    steps = st.session_state["join_plan"]["steps"]
+    new_index = index + direction
+    if new_index < 0 or new_index >= len(steps):
+        return
+    steps[index], steps[new_index] = steps[new_index], steps[index]
+    for i, step in enumerate(steps):
+        step["step_id"] = _safe_step_id(i)
+
+
+def _sanitize_step_keys(step: dict[str, Any], left_columns: list[str], right_columns: list[str]) -> None:
+    """Remove stale key selections after table/column changes."""
+    step["left_keys"] = [c for c in step.get("left_keys", []) if c in left_columns]
+    step["right_keys"] = [c for c in step.get("right_keys", []) if c in right_columns]
+    step["left_by_keys"] = [c for c in step.get("left_by_keys", []) if c in left_columns]
+    step["right_by_keys"] = [c for c in step.get("right_by_keys", []) if c in right_columns]
+
+
+def _seed_union_mapping_suggestions(step: dict[str, Any], left_columns: list[str], right_columns: list[str]) -> None:
+    """Populate missing union column mappings using heuristic suggestions."""
+    existing = step.get("union_column_mapping", {})
+    if not isinstance(existing, dict):
+        existing = {}
+    existing = {str(k): str(v) for k, v in existing.items() if str(k) in right_columns}
+
+    suggestions = suggest_union_column_mapping(left_columns, right_columns)
+    for right_col in right_columns:
+        current = existing.get(right_col)
+        if current and (current in left_columns or current in UNION_MAPPING_SPECIAL_OPTIONS):
+            continue
+        suggestion = suggestions.get(right_col)
+        if suggestion and suggestion.suggested_left_column in left_columns:
+            existing[right_col] = suggestion.suggested_left_column
+        else:
+            # Keep exact-name matches as-is if available; otherwise mark as new column.
+            existing[right_col] = right_col if right_col in left_columns else UNION_KEEP_AS_NEW
+    step["union_column_mapping"] = existing
+
+
+def _render_union_mapping_editor(step: dict[str, Any], step_id: str, left_columns: list[str], right_columns: list[str]) -> None:
+    """Render editable union column mapping with auto suggestions."""
+    if not left_columns or not right_columns:
+        st.caption("Union列マッピングを表示するには、左/右テーブルのプレビューが必要です。")
+        return
+
+    _seed_union_mapping_suggestions(step, left_columns, right_columns)
+    mapping = dict(step.get("union_column_mapping", {}))
+    suggestions = suggest_union_column_mapping(left_columns, right_columns)
+
+    st.caption("Union列マッピング（右列 -> 左列 / 新規列 / 除外）")
+    with st.expander("列マッピング提案を確認/修正", expanded=False):
+        for right_col in right_columns:
+            suggestion = suggestions.get(right_col)
+            suggested_left = suggestion.suggested_left_column if suggestion else None
+            score_text = f"{suggestion.score:.2f}" if suggestion else "0.00"
+            reason_text = suggestion.reason if suggestion else "no suggestion"
+
+            row1, row2 = st.columns([2, 3])
+            with row1:
+                st.text(f"{right_col}")
+                st.caption(f"提案: {suggested_left or '新規列'} ({score_text}, {reason_text})")
+            with row2:
+                options = [UNION_KEEP_AS_NEW, UNION_DROP] + left_columns
+                current_target = mapping.get(right_col, UNION_KEEP_AS_NEW)
+                if current_target not in options:
+                    current_target = UNION_KEEP_AS_NEW
+                selected = st.selectbox(
+                    f"target_{right_col}",
+                    options=options,
+                    index=options.index(current_target),
+                    key=f"union_map_{step_id}_{right_col}",
+                    format_func=lambda v: (
+                        "新規列として保持" if v == UNION_KEEP_AS_NEW else "この列を除外" if v == UNION_DROP else v
+                    ),
+                    label_visibility="collapsed",
+                )
+                mapping[right_col] = selected
+
+        step["union_column_mapping"] = mapping
+
+    col_a, col_b = st.columns(2)
+    with col_a:
+        step["union_right_column_suffix"] = st.text_input(
+            "新規列suffix（衝突時）",
+            value=str(step.get("union_right_column_suffix", "_u")),
+            key=f"union_suffix_{step_id}",
+        )
+    with col_b:
+        step["union_add_source_column"] = st.checkbox(
+            "source列を追加",
+            value=bool(step.get("union_add_source_column", False)),
+            key=f"union_add_source_{step_id}",
+        )
+
+    if step.get("union_add_source_column", False):
+        src_a, src_b = st.columns(2)
+        with src_a:
+            step["union_source_column_name"] = st.text_input(
+                "source列名",
+                value=str(step.get("union_source_column_name", "_source_table")),
+                key=f"union_source_colname_{step_id}",
+            )
+        with src_b:
+            step["union_source_value"] = st.text_input(
+                "右テーブルsource値",
+                value=str(step.get("union_source_value", "")),
+                key=f"union_source_value_{step_id}",
+            )
+
+
+def _render_join_plan_sidebar(
+    uploaded_map: dict[str, dict[str, Any]],
+    table_previews: dict[str, pd.DataFrame],
+) -> bool:
+    """Render the join/union plan editor in the sidebar and return whether execution was requested."""
+    _ensure_join_plan_shape()
+    plan = st.session_state["join_plan"]
+    table_cfgs = st.session_state["table_configs"]
+    table_ids = list(table_cfgs.keys())
+
+    st.sidebar.subheader("Join / Union Plan")
+    if not table_ids:
+        st.sidebar.info("ファイルをアップロードするとステップを編集できます。")
+        return False
+
+    base_labels = {tid: _table_label(tid, table_cfgs, uploaded_map) for tid in table_ids}
+    if plan["base_table_id"] not in table_cfgs:
+        plan["base_table_id"] = table_ids[0]
+
+    plan["base_table_id"] = st.sidebar.selectbox(
+        "ベーステーブル",
+        options=table_ids,
+        index=table_ids.index(plan["base_table_id"]) if plan["base_table_id"] in table_ids else 0,
+        format_func=lambda tid: base_labels.get(tid, tid),
+        key="join_plan_base_table_select",
+    )
+    plan["row_explosion_warn_ratio"] = float(
+        st.sidebar.number_input(
+            "行数増加警告しきい値 (x)",
+            min_value=1.1,
+            max_value=1000.0,
+            value=float(plan.get("row_explosion_warn_ratio", 10.0)),
+            step=0.5,
+            key="row_explosion_warn_ratio_input",
+        )
+    )
+
+    add_col, reset_col = st.sidebar.columns(2)
+    with add_col:
+        if st.button("ステップ追加", key="add_join_step_btn", use_container_width=True):
+            default_right = next((tid for tid in table_ids if tid != plan["base_table_id"]), "")
+            plan["steps"].append(_make_new_step(default_right))
+            _rerun()
+    with reset_col:
+        if st.button("全削除", key="clear_join_steps_btn", use_container_width=True):
+            plan["steps"] = []
+            _rerun()
+
+    current_preview = table_previews.get(plan["base_table_id"])
+    preview_engine = PandasEquiJoinEngine()
+    preview_step_errors: list[str | None] = []
+
+    for idx, step in enumerate(plan["steps"]):
+        if step.get("step_id") is None:
+            step["step_id"] = _safe_step_id(idx)
+        step_id = str(step["step_id"])
+
+        with st.sidebar.expander(f"{step_id}", expanded=(idx == 0)):
+            ctrl_cols = st.columns(3)
+            with ctrl_cols[0]:
+                if st.button("↑", key=f"step_up_{step_id}", use_container_width=True):
+                    _move_step(idx, -1)
+                    _rerun()
+            with ctrl_cols[1]:
+                if st.button("↓", key=f"step_down_{step_id}", use_container_width=True):
+                    _move_step(idx, 1)
+                    _rerun()
+            with ctrl_cols[2]:
+                if st.button("削除", key=f"step_del_{step_id}", use_container_width=True):
+                    plan["steps"].pop(idx)
+                    for i, s in enumerate(plan["steps"]):
+                        s["step_id"] = _safe_step_id(i)
+                    _rerun()
+
+            step["operation"] = st.selectbox(
+                "ステップ種別",
+                options=STEP_OPERATION_OPTIONS,
+                index=STEP_OPERATION_OPTIONS.index(step.get("operation", "join"))
+                if step.get("operation", "join") in STEP_OPERATION_OPTIONS
+                else 0,
+                key=f"step_operation_{step_id}",
+            )
+
+            step["right_table_id"] = st.selectbox(
+                "右テーブル",
+                options=[""] + table_ids,
+                index=([""] + table_ids).index(step.get("right_table_id", ""))
+                if step.get("right_table_id", "") in ([""] + table_ids)
+                else 0,
+                format_func=lambda tid: "(未選択)" if tid == "" else base_labels.get(tid, tid),
+                key=f"right_table_select_{step_id}",
+            )
+
+            if step["operation"] == "join":
+                step["join_algorithm"] = st.selectbox(
+                    "Joinアルゴリズム",
+                    options=JOIN_ALGORITHM_OPTIONS,
+                    index=JOIN_ALGORITHM_OPTIONS.index(step.get("join_algorithm", "equi"))
+                    if step.get("join_algorithm", "equi") in JOIN_ALGORITHM_OPTIONS
+                    else 0,
+                    key=f"join_algorithm_{step_id}",
+                )
+            else:
+                step["join_algorithm"] = "equi"
+
+            left_columns = list(current_preview.columns) if isinstance(current_preview, pd.DataFrame) else []
+            right_preview = table_previews.get(step["right_table_id"]) if step.get("right_table_id") else None
+            right_columns = list(right_preview.columns) if isinstance(right_preview, pd.DataFrame) else []
+            _sanitize_step_keys(step, left_columns, right_columns)
+
+            if step["operation"] == "join":
+                if step.get("join_algorithm", "equi") == "equi":
+                    step["join_type"] = st.selectbox(
+                        "結合種別",
+                        options=JOIN_TYPE_OPTIONS,
+                        index=JOIN_TYPE_OPTIONS.index(step.get("join_type", "left"))
+                        if step.get("join_type", "left") in JOIN_TYPE_OPTIONS
+                        else JOIN_TYPE_OPTIONS.index("left"),
+                        key=f"join_type_{step_id}",
+                    )
+                    step["left_keys"] = st.multiselect(
+                        "左キー（前段結果）",
+                        options=left_columns,
+                        default=step.get("left_keys", []),
+                        key=f"left_keys_{step_id}",
+                    )
+                    step["right_keys"] = st.multiselect(
+                        "右キー",
+                        options=right_columns,
+                        default=step.get("right_keys", []),
+                        key=f"right_keys_{step_id}",
+                    )
+                else:
+                    step["join_type"] = "left"
+                    st.caption("asof join は MVP では left のみ")
+
+                    left_key_current = step.get("left_keys", [None])[0] if step.get("left_keys") else None
+                    right_key_current = step.get("right_keys", [None])[0] if step.get("right_keys") else None
+
+                    left_choice = st.selectbox(
+                        "asof 左キー（時刻/数値）",
+                        options=[""] + left_columns,
+                        index=([""] + left_columns).index(left_key_current)
+                        if left_key_current in ([""] + left_columns)
+                        else 0,
+                        key=f"asof_left_key_{step_id}",
+                    )
+                    step["left_keys"] = [left_choice] if left_choice else []
+
+                    right_choice = st.selectbox(
+                        "asof 右キー（時刻/数値）",
+                        options=[""] + right_columns,
+                        index=([""] + right_columns).index(right_key_current)
+                        if right_key_current in ([""] + right_columns)
+                        else 0,
+                        key=f"asof_right_key_{step_id}",
+                    )
+                    step["right_keys"] = [right_choice] if right_choice else []
+
+                    step["left_by_keys"] = st.multiselect(
+                        "asof 左byキー（任意）",
+                        options=left_columns,
+                        default=step.get("left_by_keys", []),
+                        key=f"asof_left_by_keys_{step_id}",
+                    )
+                    step["right_by_keys"] = st.multiselect(
+                        "asof 右byキー（任意）",
+                        options=right_columns,
+                        default=step.get("right_by_keys", []),
+                        key=f"asof_right_by_keys_{step_id}",
+                    )
+                    step["asof_direction"] = st.selectbox(
+                        "asof方向",
+                        options=ASOF_DIRECTION_OPTIONS,
+                        index=ASOF_DIRECTION_OPTIONS.index(step.get("asof_direction", "backward"))
+                        if step.get("asof_direction", "backward") in ASOF_DIRECTION_OPTIONS
+                        else 0,
+                        key=f"asof_direction_{step_id}",
+                    )
+                    step["asof_tolerance"] = st.text_input(
+                        "asof許容幅（例: 5min / 1D / 10）",
+                        value=str(step.get("asof_tolerance", "")),
+                        key=f"asof_tolerance_{step_id}",
+                    )
+                    step["asof_allow_exact_matches"] = st.checkbox(
+                        "完全一致を許可",
+                        value=bool(step.get("asof_allow_exact_matches", True)),
+                        key=f"asof_exact_{step_id}",
+                    )
+
+                step["conflict_policy"] = st.selectbox(
+                    "同名列衝突",
+                    options=CONFLICT_POLICY_OPTIONS,
+                    index=CONFLICT_POLICY_OPTIONS.index(step.get("conflict_policy", "keep_both"))
+                    if step.get("conflict_policy", "keep_both") in CONFLICT_POLICY_OPTIONS
+                    else CONFLICT_POLICY_OPTIONS.index("keep_both"),
+                    key=f"conflict_policy_{step_id}",
+                )
+                suffixes = step.get("suffixes", ["_l", "_r"])
+                if not isinstance(suffixes, list) or len(suffixes) != 2:
+                    suffixes = ["_l", "_r"]
+                suf_col1, suf_col2 = st.columns(2)
+                with suf_col1:
+                    suffixes[0] = st.text_input("左suffix", value=str(suffixes[0]), key=f"suffix_l_{step_id}")
+                with suf_col2:
+                    suffixes[1] = st.text_input("右suffix", value=str(suffixes[1]), key=f"suffix_r_{step_id}")
+                step["suffixes"] = [suffixes[0], suffixes[1]]
+            else:
+                st.caption("Union（縦方向連結）: 列名推定 + 手動修正")
+                _render_union_mapping_editor(step, step_id, left_columns, right_columns)
+
+            preview_error: str | None = None
+            if not isinstance(current_preview, pd.DataFrame):
+                preview_error = "前段結果プレビューなし"
+                current_preview = None
+            elif not isinstance(right_preview, pd.DataFrame):
+                preview_error = "右テーブルプレビューなし"
+                current_preview = None
+            else:
+                if step["operation"] == "join":
+                    if step.get("join_algorithm", "equi") == "equi":
+                        if (
+                            not step.get("left_keys")
+                            or not step.get("right_keys")
+                            or len(step.get("left_keys", [])) != len(step.get("right_keys", []))
+                        ):
+                            preview_error = "キー未設定/不一致"
+                    else:
+                        if len(step.get("left_keys", [])) != 1 or len(step.get("right_keys", [])) != 1:
+                            preview_error = "asofキー未設定"
+                        elif len(step.get("left_by_keys", [])) != len(step.get("right_by_keys", [])):
+                            preview_error = "asof byキー数不一致"
+
+                if preview_error is None:
+                    try:
+                        temp_step = JoinStep.from_dict(step)
+                        temp_result = preview_engine.execute_step(
+                            current_preview.head(PREVIEW_PLAN_ROWS),
+                            right_preview.head(PREVIEW_PLAN_ROWS),
+                            temp_step,
+                            row_explosion_warn_ratio=float(plan.get("row_explosion_warn_ratio", 10.0)),
+                        )
+                        current_preview = temp_result.output_df.head(PREVIEW_PLAN_ROWS)
+                    except Exception as exc:
+                        preview_error = str(exc)
+                        current_preview = None
+
+            if preview_error:
+                st.caption(f"プレビュー: {preview_error}")
+            elif isinstance(current_preview, pd.DataFrame):
+                st.caption(f"プレビュー結果: {current_preview.shape[0]} x {current_preview.shape[1]}")
+            preview_step_errors.append(preview_error)
+
+    if any(err for err in preview_step_errors):
+        st.sidebar.caption("一部ステップのプレビュー推定に失敗しています。実行時に詳細エラーを表示します。")
+
+    st.sidebar.subheader("出力設定")
+    output_settings = st.session_state["output_settings"]
+    output_settings["default_format"] = st.sidebar.selectbox(
+        "既定出力形式",
+        options=["csv", "excel"],
+        index=["csv", "excel"].index(output_settings.get("default_format", "csv"))
+        if output_settings.get("default_format", "csv") in ["csv", "excel"]
+        else 0,
+        key="output_default_format",
+    )
+    output_settings["csv_encoding"] = st.sidebar.selectbox(
+        "CSV出力エンコーディング",
+        options=["utf-8-sig", "utf-8", "cp932"],
+        index=["utf-8-sig", "utf-8", "cp932"].index(output_settings.get("csv_encoding", "utf-8-sig"))
+        if output_settings.get("csv_encoding", "utf-8-sig") in ["utf-8-sig", "utf-8", "cp932"]
+        else 0,
+        key="output_csv_encoding",
+    )
+    output_settings["excel_sheet_name"] = st.sidebar.text_input(
+        "Excelシート名",
+        value=str(output_settings.get("excel_sheet_name", "result")),
+        key="output_excel_sheet_name",
+    )
+
+    st.sidebar.subheader("実行")
+    return bool(st.sidebar.button("Plan実行", type="primary", key="run_join_plan_button", use_container_width=True))
+
+
+def _render_recipe_sidebar(uploaded_map: dict[str, dict[str, Any]]) -> None:
+    """Render recipe import/export controls in the sidebar."""
+    st.sidebar.subheader("レシピ")
+    try:
+        recipe = _current_recipe()
+        recipe_text = recipe_to_json(recipe)
+        st.sidebar.download_button(
+            "レシピJSONを保存",
+            data=recipe_text.encode("utf-8"),
+            file_name="datastitcher_recipe.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+    except Exception as exc:
+        st.sidebar.caption(f"レシピ保存準備エラー: {exc}")
+
+    recipe_upload = st.sidebar.file_uploader(
+        "レシピJSONを読み込む",
+        type=["json"],
+        accept_multiple_files=False,
+        key="recipe_json_uploader",
+    )
+    if st.sidebar.button("レシピ適用", key="apply_recipe_button", use_container_width=True):
+        if recipe_upload is None:
+            st.session_state["recipe_import_message"] = ("error", "レシピJSONファイルを選択してください。")
+        else:
+            try:
+                text = recipe_upload.getvalue().decode("utf-8")
+                recipe = recipe_from_json(text)
+                _apply_recipe_to_state(recipe)
+                st.session_state["recipe_import_message"] = (
+                    "success",
+                    f"レシピを適用しました (version={recipe.version}, tables={len(recipe.tables)}, steps={len(recipe.join_plan.steps)})",
+                )
+                _rerun()
+            except Exception as exc:
+                st.session_state["recipe_import_message"] = ("error", f"レシピ適用に失敗: {exc}")
+
+    msg = st.session_state.get("recipe_import_message")
+    if isinstance(msg, tuple) and len(msg) == 2:
+        level, text = msg
+        if level == "success":
+            st.sidebar.success(str(text))
+        else:
+            st.sidebar.error(str(text))
+
+
+def _load_table_for_execution(
+    table_id: str,
+    uploaded_map: dict[str, dict[str, Any]],
+    cache: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """Load and cache a full prepared table for execution."""
+    if table_id in cache:
+        return cache[table_id]
+    table_cfgs = st.session_state["table_configs"]
+    if table_id not in table_cfgs:
+        raise UserInputError(f"テーブル定義が見つかりません: {table_id}")
+    if table_id not in uploaded_map:
+        cfg = TableConfig.from_dict(table_cfgs[table_id])
+        raise UserInputError(
+            f"テーブル '{cfg.table_name}' ({cfg.source_file_name}) のファイルがアップロードされていません。"
+        )
+    cfg = TableConfig.from_dict(table_cfgs[table_id])
+    raw_bytes = uploaded_map[table_id]["bytes"]
+    df = load_table_bytes(raw_bytes, cfg, nrows=None)
+    cache[table_id] = df
+    return df
+
+
+def _execute_plan(uploaded_map: dict[str, dict[str, Any]]) -> None:
+    """Execute the current join plan and persist results in session state."""
+    join_plan = _get_join_plan_model()
+    recipe = _current_recipe()
+    load_cache: dict[str, pd.DataFrame] = {}
+
+    def loader(table_id: str) -> pd.DataFrame:
+        return _load_table_for_execution(table_id, uploaded_map, load_cache)
+
+    execution_result = execute_join_plan(join_plan=join_plan, load_table=loader, engine=PandasEquiJoinEngine())
+
+    st.session_state["last_execution"] = {
+        "executed_at": datetime.now(timezone.utc).isoformat(),
+        "result": execution_result,
+    }
+
+    input_files = []
+    for table_id, raw_cfg in st.session_state["table_configs"].items():
+        cfg = TableConfig.from_dict(raw_cfg)
+        file_meta = uploaded_map.get(table_id)
+        table_df = load_cache.get(table_id)
+        input_files.append(
+            {
+                "table_id": table_id,
+                "table_name": cfg.table_name,
+                "file_name": cfg.source_file_name,
+                "source_kind": cfg.source_kind,
+                "sha256": cfg.file_hash or (file_meta["sha256"] if file_meta else None),
+                "rows": int(table_df.shape[0]) if isinstance(table_df, pd.DataFrame) else None,
+                "cols": int(table_df.shape[1]) if isinstance(table_df, pd.DataFrame) else None,
+            }
+        )
+
+    log_entry = ExecutionLogEntry(
+        executed_at=datetime.now(timezone.utc).isoformat(),
+        recipe_version=recipe.version,
+        input_files=input_files,
+        base_table_id=join_plan.base_table_id,
+        step_reports=[s.report.to_dict() for s in execution_result.step_results],
+        final_shape=(int(execution_result.final_df.shape[0]), int(execution_result.final_df.shape[1])),
+        status="success",
+    )
+    append_execution_log(log_entry, LOG_PATH)
+
+
+def _render_step_report(step_result: Any, step_index: int) -> None:
+    """Render one step report and unmatched downloads."""
+    report = step_result.report
+    step = step_result.step
+
+    st.markdown(
+        f"**Step {step_index+1}**: operation=`{getattr(step, 'operation', 'join')}` / "
+        f"algorithm=`{getattr(step, 'join_algorithm', 'equi') if getattr(step, 'operation', 'join') == 'join' else 'union'}`"
+    )
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("左入力行数", report.left_rows)
+    col2.metric("右入力行数", report.right_rows)
+    col3.metric("出力行数", report.output_rows)
+    growth_display = (
+        f"{report.row_growth_ratio_vs_left:.2f}x" if report.row_growth_ratio_vs_left is not None else "-"
+    )
+    col4.metric("左比行数", growth_display)
+
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("左マッチ行数", report.matched_left_rows)
+    q2.metric("左未マッチ行数", report.unmatched_left_rows)
+    q3.metric("右マッチ行数", report.matched_right_rows)
+    q4.metric("右未マッチ行数", report.unmatched_right_rows)
+
+    rate_left = f"{report.left_match_rate * 100:.1f}%" if report.left_match_rate is not None else "-"
+    rate_right = f"{report.right_match_rate * 100:.1f}%" if report.right_match_rate is not None else "-"
+    st.caption(
+        f"マッチ率: 左 {rate_left} / 右 {rate_right} | 重複キー行数: 左 {report.left_duplicate_key_rows}, 右 {report.right_duplicate_key_rows}"
+    )
+
+    if getattr(step, "operation", "join") == "join":
+        if getattr(step, "join_algorithm", "equi") == "asof":
+            st.caption(
+                f"asof設定: direction={getattr(step, 'asof_direction', 'backward')}, "
+                f"tolerance={getattr(step, 'asof_tolerance', '') or '(none)'}, "
+                f"allow_exact_matches={getattr(step, 'asof_allow_exact_matches', True)}"
+            )
+            st.markdown(
+                f"**キー**: asof 左={step.left_keys} / asof 右={step.right_keys} / by 左={getattr(step, 'left_by_keys', [])} / by 右={getattr(step, 'right_by_keys', [])}"
+            )
+        else:
+            st.markdown(
+                f"**設定**: `{step.join_type}` / 左キー={step.left_keys} / 右キー={step.right_keys} / 衝突={step.conflict_policy}"
+            )
+    else:
+        mapping = getattr(step, "union_column_mapping", {}) or {}
+        sample_mapping = list(mapping.items())[:10]
+        st.caption(
+            f"Union列マッピング数: {len(mapping)} / 例: {sample_mapping if sample_mapping else 'なし'}"
+        )
+
+    if report.details:
+        st.json(report.details)
+
+    if getattr(step, "operation", "join") == "union":
+        st.info("Unionステップでは未マッチ抽出は適用しません。")
+        return
+
+    st.markdown("未マッチ抽出")
+    dl1, dl2 = st.columns(2)
+    left_unmatched = step_result.unmatched_left_df
+    right_unmatched = step_result.unmatched_right_df
+    with dl1:
+        st.caption(f"左未マッチ: {left_unmatched.shape[0]} 行")
+        st.dataframe(left_unmatched.head(100), use_container_width=True, height=220)
+        st.download_button(
+            "左未マッチCSV",
+            data=dataframe_to_csv_bytes(left_unmatched, encoding="utf-8-sig"),
+            file_name=f"step{step_index+1}_left_unmatched.csv",
+            mime="text/csv",
+            key=f"dl_left_unmatched_{step_index}",
+            use_container_width=True,
+        )
+    with dl2:
+        st.caption(f"右未マッチ: {right_unmatched.shape[0]} 行")
+        st.dataframe(right_unmatched.head(100), use_container_width=True, height=220)
+        st.download_button(
+            "右未マッチCSV",
+            data=dataframe_to_csv_bytes(right_unmatched, encoding="utf-8-sig"),
+            file_name=f"step{step_index+1}_right_unmatched.csv",
+            mime="text/csv",
+            key=f"dl_right_unmatched_{step_index}",
+            use_container_width=True,
+        )
+
+
+def _render_execution_result() -> None:
+    """Render the latest execution result if available."""
+    payload = st.session_state.get("last_execution")
+    if not payload:
+        st.info("Plan実行後に最終結果・品質指標を表示します。")
+        return
+
+    execution_result = payload["result"]
+    final_df: pd.DataFrame = execution_result.final_df
+    output_settings = _get_output_settings_model()
+
+    st.subheader("最終結果")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("行数", int(final_df.shape[0]))
+    m2.metric("列数", int(final_df.shape[1]))
+    m3.metric("実行時刻", payload.get("executed_at", "-"))
+
+    if len(final_df) > EXCEL_MAX_ROWS:
+        st.warning(
+            f"Excelの1シート上限 ({EXCEL_MAX_ROWS:,} 行) を超えています。CSV出力を推奨します。"
+        )
+
+    preview_rows = int(st.session_state["preview_rows"])
+    st.caption(f"最終結果プレビュー（先頭 {preview_rows} 行）")
+    st.dataframe(final_df.head(preview_rows), use_container_width=True, height=360)
+
+    csv_bytes = dataframe_to_csv_bytes(final_df, encoding=output_settings.csv_encoding)
+    excel_bytes = dataframe_to_excel_bytes(final_df, sheet_name=output_settings.excel_sheet_name)
+
+    dlc1, dlc2 = st.columns(2)
+    with dlc1:
+        st.download_button(
+            "CSVダウンロード",
+            data=csv_bytes,
+            file_name="datastitcher_result.csv",
+            mime="text/csv",
+            key="download_final_csv",
+            use_container_width=True,
+        )
+    with dlc2:
+        st.download_button(
+            "Excelダウンロード (1シート)",
+            data=excel_bytes,
+            file_name="datastitcher_result.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="download_final_excel",
+            use_container_width=True,
+        )
+
+    st.subheader("ステップ品質指標（Join / Union）")
+    if not execution_result.step_results:
+        st.info("ステップがないため、ベーステーブルをそのまま出力しています。")
+        return
+
+    tabs = st.tabs([f"Step {i+1}" for i in range(len(execution_result.step_results))])
+    for i, (tab, step_result) in enumerate(zip(tabs, execution_result.step_results)):
+        with tab:
+            _render_step_report(step_result, i)
+
+
+def run() -> None:
+    """Streamlit app entrypoint."""
+    st.set_page_config(page_title="DataStitcher MVP", layout="wide")
+    init_session_state()
+
+    st.title("DataStitcher (MVP+)")
+    st.caption("複数のCSV/XLSXを多段 Join / asof join / Union で統合し、CSV / Excelとして出力するローカルツール")
+
+    st.sidebar.header("操作")
+    uploaded_files = st.sidebar.file_uploader(
+        "ファイルをアップロード (CSV / XLSX 混在可)",
+        type=["csv", "xlsx"],
+        accept_multiple_files=True,
+        key="data_files_uploader",
+    )
+    st.session_state["preview_rows"] = int(
+        st.sidebar.number_input(
+            "プレビュー行数",
+            min_value=10,
+            max_value=500,
+            value=int(st.session_state.get("preview_rows", PREVIEW_ROWS_DEFAULT)),
+            step=10,
+            key="preview_rows_input",
+        )
+    )
+
+    uploaded_map = _sync_uploaded_files(uploaded_files or [])
+
+    st.sidebar.caption(
+        f"アップロード済み: {len(uploaded_map)} 件 / テーブル定義: {len(st.session_state['table_configs'])} 件"
+    )
+
+    table_previews, _preview_errors = _render_table_management(uploaded_map)
+
+    run_requested = _render_join_plan_sidebar(uploaded_map, table_previews)
+    _render_recipe_sidebar(uploaded_map)
+
+    if run_requested:
+        try:
+            _execute_plan(uploaded_map)
+            st.success("Planを実行しました。")
+        except Exception as exc:
+            if isinstance(exc, DataStitcherError):
+                st.error(f"実行エラー: {exc}")
+            else:
+                _show_exception("実行エラー", exc if isinstance(exc, Exception) else Exception(str(exc)))
+
+    _render_execution_result()
+
+
+
