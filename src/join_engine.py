@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Yamamoto Yota
-
 """Join engine abstraction and pandas implementation for join/union steps."""
 
 from __future__ import annotations
@@ -210,10 +207,10 @@ def _execute_union_step(
             continue
 
         if target not in left_cols:
-            raise UserInputError(f"{step.step_id}: Union列マッピングの対象列が左側に存在しません: {col} -> {target}")
+            raise UserInputError(f"{step.step_id}: 縦連結の列対応先が左側に存在しません: {col} -> {target}")
         if target in mapped_targets:
             raise UserInputError(
-                f"{step.step_id}: Union列マッピングで複数の右列が同じ左列に割り当てられています: {mapped_targets[target]}, {col} -> {target}"
+                f"{step.step_id}: 縦連結の列対応で複数の右列が同じ左列に割り当てられています: {mapped_targets[target]}, {col} -> {target}"
             )
         mapped_targets[target] = col
         if col != target:
@@ -320,7 +317,7 @@ def _validate_asof_step_inputs(left_df: pd.DataFrame, right_df: pd.DataFrame, st
     if step.operation != "join":
         raise UserInputError(f"{step.step_id}: asof join は join ステップとして設定してください。")
     if step.join_type != "left":
-        raise UserInputError(f"{step.step_id}: asof join は MVP では left join のみ対応です。")
+        raise UserInputError(f"{step.step_id}: asof join は left join のみ対応です。")
     if len(step.left_keys) != 1 or len(step.right_keys) != 1:
         raise UserInputError(f"{step.step_id}: asof join は時間キーを左右1列ずつ指定してください。")
     if len(step.left_by_keys) != len(step.right_by_keys):
@@ -342,7 +339,7 @@ def _validate_union_step_inputs(right_df: pd.DataFrame, step: JoinStep) -> None:
     if unknown_map_cols:
         # Non-fatal in many UI flows; keep it strict at execution for predictable behavior.
         raise UserInputError(
-            f"{step.step_id}: Union列マッピングに右テーブルに存在しない列が含まれています: {', '.join(unknown_map_cols)}"
+            f"{step.step_id}: 縦連結の列対応に右テーブルに存在しない列が含まれています: {', '.join(unknown_map_cols)}"
         )
 
 
@@ -463,4 +460,3 @@ def execute_join_plan(
         step_results.append(step_result)
 
     return JoinExecutionResult(final_df=current_df, step_results=step_results)
-

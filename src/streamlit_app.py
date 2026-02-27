@@ -1,10 +1,10 @@
-# SPDX-License-Identifier: MIT
-# Copyright (c) 2026 Yamamoto Yota
-
-"""Streamlit UI for the DataStitcher MVP."""
+"""DataStitcher の Streamlit 画面定義。"""
 
 from __future__ import annotations
 
+import os
+import signal
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +54,14 @@ def _rerun() -> None:
         st.rerun()
     else:  # pragma: no cover - compatibility branch
         st.experimental_rerun()
+
+
+def _shutdown_app_server() -> None:
+    """Terminate the current Streamlit process from the UI."""
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+    except Exception:
+        os._exit(0)  # noqa: PLW1510
 
 
 def _short_hash(text: str) -> str:
@@ -341,6 +349,7 @@ def _render_table_management(
     preview_rows = int(st.session_state["preview_rows"])
 
     st.subheader("入力テーブル")
+    st.caption("読み込み設定（文字コード・シート・ヘッダ行・型）を調整し、結合前データを確認します。")
     if not table_cfgs:
         st.info("サイドバーから CSV / Excel ファイルをアップロードしてください。")
         return previews, preview_errors
@@ -548,14 +557,14 @@ def _seed_union_mapping_suggestions(step: dict[str, Any], left_columns: list[str
 def _render_union_mapping_editor(step: dict[str, Any], step_id: str, left_columns: list[str], right_columns: list[str]) -> None:
     """Render editable union column mapping with auto suggestions."""
     if not left_columns or not right_columns:
-        st.caption("Union列マッピングを表示するには、左/右テーブルのプレビューが必要です。")
+        st.caption("縦連結の列対応を表示するには、左/右テーブルのプレビューが必要です。")
         return
 
     _seed_union_mapping_suggestions(step, left_columns, right_columns)
     mapping = dict(step.get("union_column_mapping", {}))
     suggestions = suggest_union_column_mapping(left_columns, right_columns)
 
-    st.caption("Union列マッピング（右列 -> 左列 / 新規列 / 除外）")
+    st.caption("縦連結の列対応（右列 -> 左列 / 新規列 / 除外）")
     with st.expander("列マッピング提案を確認/修正", expanded=False):
         for right_col in right_columns:
             suggestion = suggestions.get(right_col)
@@ -595,7 +604,7 @@ def _render_union_mapping_editor(step: dict[str, Any], step_id: str, left_column
         )
     with col_b:
         step["union_add_source_column"] = st.checkbox(
-            "source列を追加",
+            "出典列を追加",
             value=bool(step.get("union_add_source_column", False)),
             key=f"union_add_source_{step_id}",
         )
@@ -604,13 +613,13 @@ def _render_union_mapping_editor(step: dict[str, Any], step_id: str, left_column
         src_a, src_b = st.columns(2)
         with src_a:
             step["union_source_column_name"] = st.text_input(
-                "source列名",
+                "出典列名",
                 value=str(step.get("union_source_column_name", "_source_table")),
                 key=f"union_source_colname_{step_id}",
             )
         with src_b:
             step["union_source_value"] = st.text_input(
-                "右テーブルsource値",
+                "右テーブルの出典値",
                 value=str(step.get("union_source_value", "")),
                 key=f"union_source_value_{step_id}",
             )
@@ -626,7 +635,8 @@ def _render_join_plan_sidebar(
     table_cfgs = st.session_state["table_configs"]
     table_ids = list(table_cfgs.keys())
 
-    st.sidebar.subheader("Join / Union Plan")
+    st.sidebar.subheader("結合・縦連結の手順")
+    st.sidebar.caption("手順は上から順に適用されます。ベーステーブルに対して段階的に設定してください。")
     if not table_ids:
         st.sidebar.info("ファイルをアップロードするとステップを編集できます。")
         return False
@@ -655,12 +665,12 @@ def _render_join_plan_sidebar(
 
     add_col, reset_col = st.sidebar.columns(2)
     with add_col:
-        if st.button("ステップ追加", key="add_join_step_btn", use_container_width=True):
+        if st.button("手順追加", key="add_join_step_btn", use_container_width=True):
             default_right = next((tid for tid in table_ids if tid != plan["base_table_id"]), "")
             plan["steps"].append(_make_new_step(default_right))
             _rerun()
     with reset_col:
-        if st.button("全削除", key="clear_join_steps_btn", use_container_width=True):
+        if st.button("手順全削除", key="clear_join_steps_btn", use_container_width=True):
             plan["steps"] = []
             _rerun()
 
@@ -697,6 +707,7 @@ def _render_join_plan_sidebar(
                 if step.get("operation", "join") in STEP_OPERATION_OPTIONS
                 else 0,
                 key=f"step_operation_{step_id}",
+                format_func=lambda op: "結合（横方向）" if op == "join" else "縦連結（Union）",
             )
 
             step["right_table_id"] = st.selectbox(
@@ -711,12 +722,13 @@ def _render_join_plan_sidebar(
 
             if step["operation"] == "join":
                 step["join_algorithm"] = st.selectbox(
-                    "Joinアルゴリズム",
+                    "結合方式",
                     options=JOIN_ALGORITHM_OPTIONS,
                     index=JOIN_ALGORITHM_OPTIONS.index(step.get("join_algorithm", "equi"))
                     if step.get("join_algorithm", "equi") in JOIN_ALGORITHM_OPTIONS
                     else 0,
                     key=f"join_algorithm_{step_id}",
+                    format_func=lambda alg: "通常結合（equi）" if alg == "equi" else "時系列近傍結合（asof）",
                 )
             else:
                 step["join_algorithm"] = "equi"
@@ -750,13 +762,13 @@ def _render_join_plan_sidebar(
                     )
                 else:
                     step["join_type"] = "left"
-                    st.caption("asof join は MVP では left のみ")
+                    st.caption("時系列近傍結合（asof）は左結合のみ対応です。")
 
                     left_key_current = step.get("left_keys", [None])[0] if step.get("left_keys") else None
                     right_key_current = step.get("right_keys", [None])[0] if step.get("right_keys") else None
 
                     left_choice = st.selectbox(
-                        "asof 左キー（時刻/数値）",
+                        "asof 左キー（時刻または数値）",
                         options=[""] + left_columns,
                         index=([""] + left_columns).index(left_key_current)
                         if left_key_current in ([""] + left_columns)
@@ -766,7 +778,7 @@ def _render_join_plan_sidebar(
                     step["left_keys"] = [left_choice] if left_choice else []
 
                     right_choice = st.selectbox(
-                        "asof 右キー（時刻/数値）",
+                        "asof 右キー（時刻または数値）",
                         options=[""] + right_columns,
                         index=([""] + right_columns).index(right_key_current)
                         if right_key_current in ([""] + right_columns)
@@ -788,7 +800,7 @@ def _render_join_plan_sidebar(
                         key=f"asof_right_by_keys_{step_id}",
                     )
                     step["asof_direction"] = st.selectbox(
-                        "asof方向",
+                        "asof 方向",
                         options=ASOF_DIRECTION_OPTIONS,
                         index=ASOF_DIRECTION_OPTIONS.index(step.get("asof_direction", "backward"))
                         if step.get("asof_direction", "backward") in ASOF_DIRECTION_OPTIONS
@@ -796,7 +808,7 @@ def _render_join_plan_sidebar(
                         key=f"asof_direction_{step_id}",
                     )
                     step["asof_tolerance"] = st.text_input(
-                        "asof許容幅（例: 5min / 1D / 10）",
+                        "asof 許容幅（例: 5min / 1D / 10）",
                         value=str(step.get("asof_tolerance", "")),
                         key=f"asof_tolerance_{step_id}",
                     )
@@ -824,7 +836,7 @@ def _render_join_plan_sidebar(
                     suffixes[1] = st.text_input("右suffix", value=str(suffixes[1]), key=f"suffix_r_{step_id}")
                 step["suffixes"] = [suffixes[0], suffixes[1]]
             else:
-                st.caption("Union（縦方向連結）: 列名推定 + 手動修正")
+                st.caption("縦連結では列対応を自動提案します。必要に応じて手動で修正してください。")
                 _render_union_mapping_editor(step, step_id, left_columns, right_columns)
 
             preview_error: str | None = None
@@ -873,6 +885,7 @@ def _render_join_plan_sidebar(
         st.sidebar.caption("一部ステップのプレビュー推定に失敗しています。実行時に詳細エラーを表示します。")
 
     st.sidebar.subheader("出力設定")
+    st.sidebar.caption("最終結果の保存形式を指定します。")
     output_settings = st.session_state["output_settings"]
     output_settings["default_format"] = st.sidebar.selectbox(
         "既定出力形式",
@@ -897,12 +910,14 @@ def _render_join_plan_sidebar(
     )
 
     st.sidebar.subheader("実行")
-    return bool(st.sidebar.button("Plan実行", type="primary", key="run_join_plan_button", use_container_width=True))
+    st.sidebar.caption("現在の手順に沿って全件処理を実行します。")
+    return bool(st.sidebar.button("処理を実行", type="primary", key="run_join_plan_button", use_container_width=True))
 
 
 def _render_recipe_sidebar(uploaded_map: dict[str, dict[str, Any]]) -> None:
     """Render recipe import/export controls in the sidebar."""
     st.sidebar.subheader("レシピ")
+    st.sidebar.caption("現在の設定を JSON で保存し、あとで同じ手順を再利用できます。")
     try:
         recipe = _current_recipe()
         recipe_text = recipe_to_json(recipe)
@@ -1021,8 +1036,8 @@ def _render_step_report(step_result: Any, step_index: int) -> None:
     step = step_result.step
 
     st.markdown(
-        f"**Step {step_index+1}**: operation=`{getattr(step, 'operation', 'join')}` / "
-        f"algorithm=`{getattr(step, 'join_algorithm', 'equi') if getattr(step, 'operation', 'join') == 'join' else 'union'}`"
+        f"**手順 {step_index+1}**: 種別=`{getattr(step, 'operation', 'join')}` / "
+        f"方式=`{getattr(step, 'join_algorithm', 'equi') if getattr(step, 'operation', 'join') == 'join' else 'union'}`"
     )
 
     col1, col2, col3, col4 = st.columns(4)
@@ -1049,9 +1064,9 @@ def _render_step_report(step_result: Any, step_index: int) -> None:
     if getattr(step, "operation", "join") == "join":
         if getattr(step, "join_algorithm", "equi") == "asof":
             st.caption(
-                f"asof設定: direction={getattr(step, 'asof_direction', 'backward')}, "
+                f"asof設定: 方向={getattr(step, 'asof_direction', 'backward')}, "
                 f"tolerance={getattr(step, 'asof_tolerance', '') or '(none)'}, "
-                f"allow_exact_matches={getattr(step, 'asof_allow_exact_matches', True)}"
+                f"完全一致許可={getattr(step, 'asof_allow_exact_matches', True)}"
             )
             st.markdown(
                 f"**キー**: asof 左={step.left_keys} / asof 右={step.right_keys} / by 左={getattr(step, 'left_by_keys', [])} / by 右={getattr(step, 'right_by_keys', [])}"
@@ -1064,14 +1079,14 @@ def _render_step_report(step_result: Any, step_index: int) -> None:
         mapping = getattr(step, "union_column_mapping", {}) or {}
         sample_mapping = list(mapping.items())[:10]
         st.caption(
-            f"Union列マッピング数: {len(mapping)} / 例: {sample_mapping if sample_mapping else 'なし'}"
+            f"縦連結の列対応数: {len(mapping)} / 例: {sample_mapping if sample_mapping else 'なし'}"
         )
 
     if report.details:
         st.json(report.details)
 
     if getattr(step, "operation", "join") == "union":
-        st.info("Unionステップでは未マッチ抽出は適用しません。")
+        st.info("縦連結の手順では未マッチ抽出は適用しません。")
         return
 
     st.markdown("未マッチ抽出")
@@ -1106,7 +1121,7 @@ def _render_execution_result() -> None:
     """Render the latest execution result if available."""
     payload = st.session_state.get("last_execution")
     if not payload:
-        st.info("Plan実行後に最終結果・品質指標を表示します。")
+        st.info("処理を実行すると、最終結果と品質指標をここに表示します。")
         return
 
     execution_result = payload["result"]
@@ -1114,6 +1129,7 @@ def _render_execution_result() -> None:
     output_settings = _get_output_settings_model()
 
     st.subheader("最終結果")
+    st.caption("全手順を適用した最終テーブルです。内容確認後に CSV または Excel で保存できます。")
     m1, m2, m3 = st.columns(3)
     m1.metric("行数", int(final_df.shape[0]))
     m2.metric("列数", int(final_df.shape[1]))
@@ -1151,12 +1167,12 @@ def _render_execution_result() -> None:
             use_container_width=True,
         )
 
-    st.subheader("ステップ品質指標（Join / Union）")
+    st.subheader("ステップ品質指標（結合・縦連結）")
     if not execution_result.step_results:
         st.info("ステップがないため、ベーステーブルをそのまま出力しています。")
         return
 
-    tabs = st.tabs([f"Step {i+1}" for i in range(len(execution_result.step_results))])
+    tabs = st.tabs([f"手順 {i+1}" for i in range(len(execution_result.step_results))])
     for i, (tab, step_result) in enumerate(zip(tabs, execution_result.step_results)):
         with tab:
             _render_step_report(step_result, i)
@@ -1164,13 +1180,16 @@ def _render_execution_result() -> None:
 
 def run() -> None:
     """Streamlit app entrypoint."""
-    st.set_page_config(page_title="DataStitcher MVP", layout="wide")
+    st.set_page_config(page_title="DataStitcher", layout="wide")
     init_session_state()
 
-    st.title("DataStitcher (MVP+)")
-    st.caption("複数のCSV/XLSXを多段 Join / asof join / Union で統合し、CSV / Excelとして出力するローカルツール")
+    st.title("DataStitcher")
+    st.caption(
+        "複数の CSV / XLSX を多段の結合（横方向）・時系列近傍結合（asof）・縦連結（Union）で統合し、CSV / Excel として出力します。"
+    )
+    st.info("使い方: 1) ファイルをアップロードして設定 2) 手順を作成 3) 処理を実行して結果を保存")
 
-    st.sidebar.header("操作")
+    st.sidebar.header("操作メニュー")
     uploaded_files = st.sidebar.file_uploader(
         "ファイルをアップロード (CSV / XLSX 混在可)",
         type=["csv", "xlsx"],
@@ -1194,6 +1213,23 @@ def run() -> None:
         f"アップロード済み: {len(uploaded_map)} 件 / テーブル定義: {len(st.session_state['table_configs'])} 件"
     )
 
+    st.sidebar.subheader("アプリ停止")
+    st.sidebar.caption("ボタンを押すと Streamlit サーバーを終了します。再開時は `streamlit run app.py` を実行してください。")
+    shutdown_confirmed = st.sidebar.checkbox(
+        "停止を確認しました",
+        value=False,
+        key="shutdown_confirm_checkbox",
+    )
+    if st.sidebar.button(
+        "アプリを停止",
+        key="shutdown_app_button",
+        use_container_width=True,
+        disabled=not shutdown_confirmed,
+    ):
+        st.sidebar.warning("アプリを停止しています...")
+        time.sleep(0.15)
+        _shutdown_app_server()
+
     table_previews, _preview_errors = _render_table_management(uploaded_map)
 
     run_requested = _render_join_plan_sidebar(uploaded_map, table_previews)
@@ -1202,7 +1238,7 @@ def run() -> None:
     if run_requested:
         try:
             _execute_plan(uploaded_map)
-            st.success("Planを実行しました。")
+            st.success("処理を実行しました。")
         except Exception as exc:
             if isinstance(exc, DataStitcherError):
                 st.error(f"実行エラー: {exc}")
@@ -1210,6 +1246,5 @@ def run() -> None:
                 _show_exception("実行エラー", exc if isinstance(exc, Exception) else Exception(str(exc)))
 
     _render_execution_result()
-
 
 
