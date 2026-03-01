@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 JoinType = Literal["inner", "left", "right", "outer"]
 ConflictPolicy = Literal["left_prefer", "right_prefer", "keep_both"]
-SourceKind = Literal["csv", "excel"]
+SourceKind = Literal["csv", "excel", "sql", "pi_da_tag", "af_attribute", "af_event_frame"]
 SimpleDType = Literal["auto", "string", "number", "datetime"]
 StepOperation = Literal["join", "union"]
 JoinAlgorithm = Literal["equi", "asof"]
@@ -71,6 +71,7 @@ class TableConfig:
     file_hash: str | None = None
     csv_options: CSVOptions = field(default_factory=CSVOptions)
     excel_options: ExcelOptions = field(default_factory=ExcelOptions)
+    source_options: dict[str, Any] = field(default_factory=dict)
     normalize_columns: bool = True
     selected_columns: list[str] = field(default_factory=list)
     dtype_overrides: dict[str, SimpleDType] = field(default_factory=dict)
@@ -88,6 +89,9 @@ class TableConfig:
             file_hash=data.get("file_hash"),
             csv_options=CSVOptions.from_dict(data.get("csv_options")),
             excel_options=ExcelOptions.from_dict(data.get("excel_options")),
+            source_options={str(k): v for k, v in data.get("source_options", {}).items()}
+            if isinstance(data.get("source_options", {}), dict)
+            else {},
             normalize_columns=bool(data.get("normalize_columns", True)),
             selected_columns=[str(v) for v in data.get("selected_columns", [])],
             dtype_overrides={str(k): str(v) for k, v in data.get("dtype_overrides", {}).items()},

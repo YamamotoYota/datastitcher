@@ -1,12 +1,13 @@
 # DataStitcher
 
-複数の `CSV` / `Excel(.xlsx)` をローカルで読み込み、結合（横方向）・時系列近傍結合（`asof`）・縦連結（`union`）で統合し、`CSV` または `Excel(1シート)` に出力する Streamlit アプリです。
+CSV / Excel / SQLデータベース / PI AF SDK からデータを取得し、結合（横方向）・時系列近傍結合（asof）・縦連結（union）で統合して、CSV または Excel（1シート）へ出力するローカル実行アプリです。
 
 ## セットアップ
 
 前提:
 - Windows（VS Code から実行想定）
 - Python 3.11 以上
+- SQL Server / PI AF SDK を使う場合は、クライアント側ドライバや PI AF Client のインストールが必要
 
 ```bash
 pip install -r requirements.txt
@@ -15,66 +16,60 @@ streamlit run app.py
 
 ## 使い方
 
-1. サイドバーから `CSV / XLSX` を複数アップロード
-2. 各テーブルで設定
-   - CSV: 文字コード / 区切り文字 / 引用符 / ヘッダ行
-   - Excel: シート / ヘッダ行
-   - 列名正規化
-   - 使用列選択
-   - 型上書き（文字 / 数値 / 日時）
+1. サイドバーから入力テーブルを追加
+- ファイル: `CSV / XLSX / XLS / XLSM` をアップロード
+- 外部ソース: `SQL追加 / PI DA追加 / AF属性追加 / AFイベント追加`
+2. 「入力テーブル」で各テーブルを設定
+- 共通: 列名正規化、使用列、型上書き
+- CSV: 文字コード/区切り文字/引用符/ヘッダ行
+- Excel: シート/ヘッダ行
+- SQL: 接続情報、テーブル一覧取得、SQLクエリ
+- PI AF SDK: 取得条件（タグ/属性/イベントフレーム）
 3. サイドバー「結合・縦連結の手順」で手順追加
-4. 各手順で「結合（横方向）」または「縦連結（Union）」を選択
-   - 結合の場合: `equi` または `asof`
-   - 縦連結の場合: 列名推定結果を確認し、必要に応じて修正
+4. 手順ごとに結合方式（equi/asof）または縦連結を設定
 5. 「処理を実行」
-6. 最終結果プレビュー / 手順品質指標 / 未マッチ抽出 / ダウンロードを確認
+6. 最終結果・品質指標・未マッチ抽出を確認してダウンロード
 
 補足:
-- サイドバー「アプリ停止」から Web 画面上でサーバー停止が可能です。
-- 停止後は `streamlit run app.py` を再実行すると再開できます。
+- サイドバーの「アプリ停止」で画面からサーバー停止できます。
+- 停止後は `streamlit run app.py` で再開できます。
 
 ## 実装済み機能
 
-### 入力 / テーブル管理
-- 複数ファイルアップロード（CSV/XLSX混在）
-- Excelシート選択 / ヘッダ行指定
-- CSV文字コード・区切り文字・引用符の `auto` 推定 + 手動指定
-- テーブル名編集
-- 使用列選択
-- 列名正規化（前後空白除去 + NFKC）
-- 型推定表示 + 型上書き（文字 / 数値 / 日時）
+### 入力ソース
+- ファイル
+  - CSV（文字コード自動推定 + 手動指定）
+  - Excel（`.xlsx`, `.xls`, `.xlsm`）
+- SQLデータベース
+  - SQL Server / MySQL / SQLite / Oracle Database / PostgreSQL
+  - 接続テスト、テーブル一覧取得、任意SQL実行
+- PI AF SDK（PI DataLink相当）
+  - PI DAタグ: Snapshot / Recorded / Interpolated / Summary
+  - PI AF属性: エレメント名 + 属性名で取得（PI DAタグ同様の行形式）
+  - PI AFイベントフレーム: テンプレート + 対象期間 + イベント生成分析名で取得
 
-### 結合 / 時系列近傍結合 / 縦連結
-- 多段手順実行（ベーステーブル → 手順1 → 手順2 ...）
+### 結合・縦連結
+- 多段手順（ベーステーブル → 手順1 → 手順2 ...）
 - 等値結合: `Inner / Left / Right / Full outer`
+- asof結合: `backward / forward / nearest`, `tolerance`, `byキー`
 - 単一キー / 複合キー
 - 同名列衝突ポリシー: `left_prefer / right_prefer / keep_both`
-- 時系列近傍結合（`asof join`）
-  - 方向: `backward / forward / nearest`
-  - 許容幅（例: `5min`, `1D`, `10`）
-  - byキー（任意、左右別列名対応）
-- 縦連結（`union`）
-  - 列名の近似推定（自動提案）
-  - ユーザによる列対応修正
-  - 新規列として保持 / 除外 を選択可能
-  - 出典列追加（任意）
+- 縦連結（union）
+  - 列名の近似提案
+  - 手動マッピング修正
+  - 新規列保持 / 除外 / 出典列追加
 
-### 品質指標 / 出力 / 再現性
-- 各手順の品質指標
-  - 入力行数 / 出力行数
-  - マッチ行数 / 未マッチ行数（結合・asof）
-  - マッチ率
-  - 多重マッチ兆候（等値結合）
-  - 行数増加警告
-- 左未マッチ / 右未マッチのCSVダウンロード（結合・asof）
-- 最終結果のCSV / Excel(1シート) ダウンロード
+### 品質指標・出力・再現性
+- 各手順で行数、マッチ率、未マッチ、多重マッチ兆候、行数増加警告を表示
+- 未マッチ行（左右）をCSVダウンロード
+- 最終結果をCSV / Excel(1シート)でダウンロード
 - Excel行数上限警告
-- レシピ JSON 保存 / 読み込み
+- レシピ JSON 保存・再読み込み
 - 実行ログ保存（`logs/execution_log.jsonl`）
 
 ## テスト用データ
 
-`data/` 配下に UI 動作確認用のCSVを同梱しています。
+`data/` に UI動作確認用データを同梱しています。
 
 主なファイル:
 - `data/01_customers.csv`
@@ -86,82 +81,60 @@ streamlit run app.py
 - `data/07_union_sales_feb_variant.csv`
 - `data/08_composite_left.csv`
 - `data/09_composite_right.csv`
-- `data/README.md`（推奨の確認手順）
 
-## アーキテクチャ / ディレクトリ構成
+## ディレクトリ構成
 
 ```text
 app.py                      # Streamlit エントリ
 src/
-  streamlit_app.py          # UI（session_state / サイドバー / プレビュー / 結果表示）
-  models.py                 # Recipe / JoinStep / JoinPlan / report のデータクラス
-  io_utils.py               # CSV/Excel読み込み、CSV自動判定、テーブル前処理
-  normalization.py          # 列名正規化ヘルパー
-  profile.py                # プロファイル / 型推定
-  column_match.py           # 縦連結向け列対応提案ロジック
-  join_engine.py            # pandas 実行エンジン（等値結合 / asof / 縦連結）
-  join_plan.py              # 手順実行ファサード
-  join_report.py            # 品質指標計算 + 未マッチ抽出
-  recipe.py                 # Recipe JSON 保存/読込/検証
-  report.py                 # CSV/Excel出力 + 実行ログ
+  streamlit_app.py          # UI（セッション状態/サイドバー/プレビュー/結果表示）
+  models.py                 # Recipe/JoinPlan/JoinStep などのデータモデル
+  io_utils.py               # CSV/Excel読み込み
+  source_loader.py          # file/sql/pi を統合ロード
+  db_connectors.py          # SQL接続・テーブル一覧・SQL実行
+  pi_af_sdk.py              # PI AF SDK 取得ロジック
+  column_match.py           # union 列対応提案
+  join_engine.py            # pandas 結合・asof・union
+  join_report.py            # 品質指標/未マッチ抽出
+  recipe.py                 # レシピJSON保存/読込/検証
+  report.py                 # 出力・実行ログ
+  normalization.py          # 列名正規化
+  profile.py                # 型推定
   errors.py                 # 独自例外
-requirements.txt
 tests/
-  test_join_engine.py       # 結合 / asof / 縦連結 / レシピの単体テスト
-logs/
-  execution_log.jsonl       # 実行ログ（実行時に生成）
+  test_join_engine.py       # 結合系テスト
+  test_source_loader.py     # ソース取得（SQLite）テスト
 data/
-  *.csv                     # 手動確認用データ
+  *.csv                     # 手動検証データ
+logs/
+  execution_log.jsonl       # 実行ログ
 ```
 
-## Recipe JSON 仕様（主要項目）
+## Recipe JSON（主要項目）
 
-トップレベル:
-- `version`
-- `created_at`
+- `version`, `created_at`
 - `tables[]`
+  - `table_id`, `table_name`, `source_kind`, `source_file_name`
+  - `csv_options` / `excel_options`
+  - `source_options`（SQL/PI設定）
+  - `normalize_columns`, `selected_columns`, `dtype_overrides`
 - `join_plan`
 - `output_settings`
 - `ui_settings`
 
-`join_plan.steps[]` の主要項目:
-- 共通
-  - `step_id`
-  - `right_table_id`
-  - `operation` (`join|union`)
-- 結合（equi）
-  - `join_algorithm` = `equi`
-  - `join_type` (`inner|left|right|outer`)
-  - `left_keys[]`, `right_keys[]`
-  - `conflict_policy`, `suffixes`
-- 時系列近傍結合（asof）
-  - `join_algorithm` = `asof`
-  - `join_type` = `left`（現状）
-  - `left_keys[]`, `right_keys[]`（各1列）
-  - `left_by_keys[]`, `right_by_keys[]`
-  - `asof_direction`, `asof_tolerance`, `asof_allow_exact_matches`
-  - `conflict_policy`, `suffixes`
-- 縦連結（union）
-  - `union_column_mapping`（右列 -> 左列 / special action）
-  - `union_right_column_suffix`
-  - `union_add_source_column`
-  - `union_source_column_name`
-  - `union_source_value`
+## 制限事項
 
-## 制限事項（現状）
-
+- PI AF SDK は実行環境に `pythonnet` と `OSIsoft.AFSDK` が必要
+- SQL接続は各DBのドライバ・ネットワーク到達性に依存
 - `asof join` は `left join` のみ対応
-- `union` の列名推定はヒューリスティック（誤推定時はUIで修正が必要）
-- `fuzzy join` / `range join` / `cross join` は未実装
-- `xls` は未対応（`xlsx` のみ）
-- pandas ベースのため、大規模データではメモリ制約あり
-- CSV自動推定はベストエフォート（誤判定時は手動指定）
+- `union` 列名推定はヒューリスティック（必要に応じて手動修正）
+- pandasベースのため大規模データではメモリ制約あり
 
 ## 例外処理
 
-- 文字コード不一致、列欠落、キー未設定、シート名不正、asofキー型不正などは UI にエラー表示
+- 文字コード不一致、列欠落、キー未設定、SQL接続失敗、PI取得失敗などを UI に表示
 - 詳細トレースバックは折りたたみ表示
-- 例外は握りつぶさず、原因を特定しやすいメッセージを返す設計
+- 例外は握りつぶさず、原因を特定しやすいメッセージを返します
 
 ## テスト
 
@@ -169,25 +142,8 @@ data/
 pytest -q
 ```
 
-含まれるテスト:
-- 複合キー等値結合 + 衝突解決
-- Full outer join + 未マッチ抽出
-- Recipe JSON roundtrip
-- asof join（byキー + tolerance）
-- union（列対応 + 新規列保持）
-
 ## ライセンス
 
 MIT License
 
 Copyright (c) 2026 Yamamoto Yota
-
-## GitHub 公開手順（最小）
-
-```bash
-git init -b main
-git add .
-git commit -m "Initial release: DataStitcher"
-git remote add origin <YOUR_GITHUB_REPO_URL>
-git push -u origin main
-```

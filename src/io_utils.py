@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv as pycsv
 import hashlib
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -61,10 +62,19 @@ def detect_csv_options(data: bytes) -> CSVOptions:
     return CSVOptions(encoding=encoding, delimiter=delimiter, quotechar=quotechar, header_row=1)
 
 
-def list_excel_sheets(data: bytes) -> list[str]:
+def _excel_engine_from_filename(file_name: str | None) -> str:
+    """Choose pandas Excel engine by file extension."""
+    suffix = Path(str(file_name or "")).suffix.lower()
+    if suffix == ".xls":
+        return "xlrd"
+    return "openpyxl"
+
+
+def list_excel_sheets(data: bytes, file_name: str | None = None) -> list[str]:
     """Return Excel sheet names."""
+    engine = _excel_engine_from_filename(file_name)
     try:
-        with pd.ExcelFile(BytesIO(data), engine="openpyxl") as xls:
+        with pd.ExcelFile(BytesIO(data), engine=engine) as xls:
             return [str(s) for s in xls.sheet_names]
     except Exception as exc:
         raise FileReadError(f"Excelシート一覧の取得に失敗しました: {exc}") from exc
@@ -103,8 +113,9 @@ def _read_csv_with_options(data: bytes, options: CSVOptions, nrows: int | None =
 
 def _read_excel_with_options(data: bytes, table: TableConfig, nrows: int | None = None) -> pd.DataFrame:
     header_idx = max(0, int(table.excel_options.header_row) - 1)
+    engine = _excel_engine_from_filename(table.source_file_name)
     try:
-        with pd.ExcelFile(BytesIO(data), engine="openpyxl") as xls:
+        with pd.ExcelFile(BytesIO(data), engine=engine) as xls:
             sheet_name = table.excel_options.sheet_name or str(xls.sheet_names[0])
             if sheet_name not in [str(s) for s in xls.sheet_names]:
                 raise UserInputError(f"Excelシート '{sheet_name}' が見つかりません。")
@@ -113,7 +124,7 @@ def _read_excel_with_options(data: bytes, table: TableConfig, nrows: int | None 
                 sheet_name=sheet_name,
                 header=header_idx,
                 nrows=nrows,
-                engine="openpyxl",
+                engine=engine,
             )
     except UserInputError:
         raise

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Yamamoto Yota
+
 """DataStitcher の Streamlit 画面定義。"""
 
 from __future__ import annotations
@@ -6,6 +9,7 @@ import os
 import signal
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -14,8 +18,9 @@ import pandas as pd
 import streamlit as st
 
 from .column_match import suggest_union_column_mapping
+from .db_connectors import SUPPORTED_DBMS, dbms_label, normalize_dbms
 from .errors import DataStitcherError, UserInputError
-from .io_utils import detect_csv_options, list_excel_sheets, load_table as load_table_bytes, read_raw_table, sha256_hex
+from .io_utils import detect_csv_options, list_excel_sheets, sha256_hex
 from .join_engine import PandasEquiJoinEngine, execute_join_plan
 from .models import (
     UNION_DROP,
@@ -28,9 +33,23 @@ from .models import (
     Recipe,
     TableConfig,
 )
+from .pi_af_sdk import (
+    SUPPORTED_PI_QUERY_TYPES,
+    SUPPORTED_SUMMARY_FUNCTIONS,
+    build_pi_query_config,
+    normalize_pi_query_type,
+)
 from .profile import profile_dataframe
 from .recipe import build_recipe, recipe_from_json, recipe_to_json
 from .report import EXCEL_MAX_ROWS, append_execution_log, dataframe_to_csv_bytes, dataframe_to_excel_bytes
+from .source_loader import (
+    PI_SOURCE_KINDS,
+    SQL_SOURCE_KIND,
+    build_sql_sample_query_from_options,
+    is_file_source,
+    list_sql_tables_from_options,
+    load_table_from_source,
+)
 
 PREVIEW_ROWS_DEFAULT = 100
 PREVIEW_PLAN_ROWS = 200
@@ -46,6 +65,9 @@ STEP_OPERATION_OPTIONS = ["join", "union"]
 JOIN_ALGORITHM_OPTIONS = ["equi", "asof"]
 ASOF_DIRECTION_OPTIONS = ["backward", "forward", "nearest"]
 UNION_MAPPING_SPECIAL_OPTIONS = [UNION_KEEP_AS_NEW, UNION_DROP]
+SQL_DB_OPTIONS = list(SUPPORTED_DBMS)
+PI_QUERY_TYPE_OPTIONS = list(SUPPORTED_PI_QUERY_TYPES)
+PI_SUMMARY_FUNCTION_OPTIONS = list(SUPPORTED_SUMMARY_FUNCTIONS)
 
 
 def _rerun() -> None:
@@ -76,6 +98,87 @@ def _safe_step_id(index_hint: int) -> str:
     return f"step_{index_hint+1}"
 
 
+def _safe_external_table_id(prefix: str) -> str:
+    """Generate deterministic-enough table id for non-file sources."""
+    return f"{prefix}_{uuid.uuid4().hex[:10]}"
+
+
+def _default_source_file_name(source_kind: str) -> str:
+    if source_kind == SQL_SOURCE_KIND:
+        return "sql_source"
+    if source_kind == "pi_da_tag":
+        return "pi_da_tag"
+    if source_kind == "af_attribute":
+        return "af_attribute"
+    if source_kind == "af_event_frame":
+        return "af_event_frame"
+    return source_kind
+
+
+def _default_source_options(source_kind: str) -> dict[str, Any]:
+    """Return source option defaults for each non-file source kind."""
+    if source_kind == SQL_SOURCE_KIND:
+        return {
+            "dbms": "sqlserver",
+            "host": "",
+            "port": "",
+            "database": "",
+            "schema": "",
+            "username": "",
+            "password": "",
+            "sqlite_path": "",
+            "query": "",
+        }
+    if source_kind == "pi_da_tag":
+        return {
+            "pi_server": "",
+            "af_server": "",
+            "af_database": "",
+            "query_type": "recorded",
+            "tags_text": "",
+            "start_time": "*-1d",
+            "end_time": "*",
+            "interval": "1h",
+            "summary_functions": ["average", "min", "max"],
+            "max_rows_per_tag": 10000,
+        }
+    if source_kind == "af_attribute":
+        return {
+            "pi_server": "",
+            "af_server": "",
+            "af_database": "",
+            "query_type": "recorded",
+            "af_element": "",
+            "af_attributes_text": "",
+            "start_time": "*-1d",
+            "end_time": "*",
+            "interval": "1h",
+            "summary_functions": ["average", "min", "max"],
+            "max_rows_per_tag": 10000,
+        }
+    if source_kind == "af_event_frame":
+        return {
+            "af_server": "",
+            "af_database": "",
+            "ef_template": "",
+            "ef_analyses_text": "",
+            "start_time": "*-1d",
+            "end_time": "*",
+            "max_rows_per_tag": 10000,
+        }
+    return {}
+
+
+def _ensure_source_options_defaults(cfg: TableConfig) -> TableConfig:
+    """Fill missing source options for external sources."""
+    if is_file_source(str(cfg.source_kind)):
+        return cfg
+    merged = _default_source_options(str(cfg.source_kind))
+    merged.update(dict(cfg.source_options or {}))
+    cfg.source_options = merged
+    return cfg
+
+
 def init_session_state() -> None:
     """Initialize all app session state keys used by the UI."""
     defaults: dict[str, Any] = {
@@ -89,6 +192,7 @@ def init_session_state() -> None:
         "preview_rows": PREVIEW_ROWS_DEFAULT,
         "last_execution": None,
         "recipe_import_message": None,
+        "source_add_message": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -99,16 +203,17 @@ def _table_kind_from_filename(name: str) -> str:
     lower = name.lower()
     if lower.endswith(".csv"):
         return "csv"
-    if lower.endswith(".xlsx"):
+    if lower.endswith(".xlsx") or lower.endswith(".xls") or lower.endswith(".xlsm"):
         return "excel"
-    raise UserInputError(f"未対応ファイル形式です: {name} (CSV / XLSX のみ)")
+    raise UserInputError(f"未対応ファイル形式です: {name} (CSV / XLSX / XLS / XLSM のみ)")
 
 
 def _table_label(table_id: str, table_cfgs: dict[str, dict[str, Any]], uploaded_map: dict[str, dict[str, Any]]) -> str:
     cfg = table_cfgs.get(table_id, {})
     display_name = str(cfg.get("table_name", table_id))
     file_name = str(cfg.get("source_file_name", ""))
-    missing = table_id not in uploaded_map
+    source_kind = str(cfg.get("source_kind", "csv"))
+    missing = is_file_source(source_kind) and table_id not in uploaded_map
     suffix = " (未アップロード)" if missing else ""
     return f"{display_name} [{file_name}]{suffix}"
 
@@ -205,12 +310,12 @@ def _sync_uploaded_files(uploaded_files: Iterable[Any]) -> dict[str, dict[str, A
                     cfg.csv_options = CSVOptions()
             else:
                 try:
-                    sheets = list_excel_sheets(data)
+                    sheets = list_excel_sheets(data, uploaded.name)
                     if sheets:
                         cfg.excel_options.sheet_name = sheets[0]
                 except Exception:
                     pass
-            _update_table_config_in_state(cfg)
+        _update_table_config_in_state(cfg)
 
     _ensure_join_plan_shape()
     _reconcile_plan_with_table_configs(uploaded_map)
@@ -339,6 +444,317 @@ def _sanitize_columns_for_table(cfg: TableConfig, available_columns: list[str]) 
     return cfg
 
 
+def _add_external_table(source_kind: str) -> None:
+    """Add a new SQL/PI table config with source-specific defaults."""
+    labels = {
+        SQL_SOURCE_KIND: "SQLテーブル",
+        "pi_da_tag": "PI DAタグ",
+        "af_attribute": "PI AF属性",
+        "af_event_frame": "PI AFイベントフレーム",
+    }
+    table_id = _safe_external_table_id(source_kind.replace("_", ""))
+    cfg = TableConfig(
+        table_id=table_id,
+        table_name=f"{labels.get(source_kind, source_kind)}_{len(st.session_state['table_configs']) + 1}",
+        source_file_name=_default_source_file_name(source_kind),
+        source_kind=source_kind,  # type: ignore[arg-type]
+        source_options=_default_source_options(source_kind),
+    )
+    _update_table_config_in_state(cfg)
+    st.session_state["source_add_message"] = ("success", f"{labels.get(source_kind, source_kind)} を追加しました。")
+
+
+def _render_source_registration_sidebar() -> None:
+    """Render quick-add buttons for non-file data sources."""
+    st.sidebar.subheader("外部データソース追加")
+    st.sidebar.caption("SQLデータベースや PI AF SDK から読み込むテーブルを追加できます。")
+
+    c1, c2 = st.sidebar.columns(2)
+    with c1:
+        if st.button("SQL追加", key="add_sql_source_btn", use_container_width=True):
+            _add_external_table(SQL_SOURCE_KIND)
+            _rerun()
+    with c2:
+        if st.button("PI DA追加", key="add_pi_da_source_btn", use_container_width=True):
+            _add_external_table("pi_da_tag")
+            _rerun()
+
+    c3, c4 = st.sidebar.columns(2)
+    with c3:
+        if st.button("AF属性追加", key="add_af_attr_source_btn", use_container_width=True):
+            _add_external_table("af_attribute")
+            _rerun()
+    with c4:
+        if st.button("AFイベント追加", key="add_af_ef_source_btn", use_container_width=True):
+            _add_external_table("af_event_frame")
+            _rerun()
+
+    msg = st.session_state.get("source_add_message")
+    if isinstance(msg, tuple) and len(msg) == 2:
+        level, text = msg
+        if level == "success":
+            st.sidebar.success(str(text))
+        else:
+            st.sidebar.error(str(text))
+
+
+def _render_sql_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
+    """Render SQL source settings editor."""
+    options = _default_source_options(SQL_SOURCE_KIND)
+    options.update(dict(cfg.source_options or {}))
+
+    dbms_value = normalize_dbms(str(options.get("dbms", "sqlserver")))
+    options["dbms"] = st.selectbox(
+        "DBMS",
+        options=SQL_DB_OPTIONS,
+        index=SQL_DB_OPTIONS.index(dbms_value) if dbms_value in SQL_DB_OPTIONS else 0,
+        key=f"sql_dbms_{table_id}",
+        format_func=dbms_label,
+    )
+    dbms_value = str(options["dbms"])
+
+    if dbms_value == "sqlite":
+        options["sqlite_path"] = st.text_input(
+            "SQLiteファイルパス",
+            value=str(options.get("sqlite_path", "")),
+            key=f"sql_sqlite_path_{table_id}",
+        )
+    else:
+        col1, col2 = st.columns(2)
+        with col1:
+            options["host"] = st.text_input(
+                "ホスト/サーバー名",
+                value=str(options.get("host", "")),
+                key=f"sql_host_{table_id}",
+            )
+            options["database"] = st.text_input(
+                "データベース名（Oracleはサービス名）",
+                value=str(options.get("database", "")),
+                key=f"sql_database_{table_id}",
+            )
+            options["username"] = st.text_input(
+                "ユーザー名",
+                value=str(options.get("username", "")),
+                key=f"sql_user_{table_id}",
+            )
+        with col2:
+            options["port"] = st.text_input(
+                "ポート（任意）",
+                value=str(options.get("port", "")),
+                key=f"sql_port_{table_id}",
+            )
+            options["schema"] = st.text_input(
+                "スキーマ（任意）",
+                value=str(options.get("schema", "")),
+                key=f"sql_schema_{table_id}",
+            )
+            options["password"] = st.text_input(
+                "パスワード",
+                value=str(options.get("password", "")),
+                key=f"sql_password_{table_id}",
+                type="password",
+            )
+
+    catalog_key = f"sql_table_catalog_{table_id}"
+    if catalog_key not in st.session_state:
+        st.session_state[catalog_key] = []
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("接続してテーブル一覧取得", key=f"sql_list_tables_{table_id}", use_container_width=True):
+            try:
+                st.session_state[catalog_key] = list_sql_tables_from_options(options)
+                st.success(f"{len(st.session_state[catalog_key])} 件のテーブルを取得しました。")
+            except Exception as exc:
+                st.error(f"テーブル一覧取得エラー: {exc}")
+    with b2:
+        sample_top_n = int(
+            st.number_input(
+                "サンプル件数",
+                min_value=1,
+                max_value=100000,
+                value=1000,
+                step=100,
+                key=f"sql_sample_n_{table_id}",
+            )
+        )
+
+    available_tables: list[str] = [str(v) for v in st.session_state.get(catalog_key, [])]
+    selected_table = st.selectbox(
+        "取得済みテーブル一覧（任意）",
+        options=[""] + available_tables,
+        index=0,
+        key=f"sql_table_pick_{table_id}",
+        format_func=lambda v: "(未選択)" if v == "" else v,
+    )
+    if st.button("SELECT文を作成", key=f"sql_build_query_{table_id}", use_container_width=False):
+        if selected_table:
+            try:
+                options["query"] = build_sql_sample_query_from_options(options, selected_table, top_n=sample_top_n)
+            except Exception as exc:
+                st.error(f"SELECT文作成エラー: {exc}")
+        else:
+            st.warning("テーブル一覧から対象テーブルを選択してください。")
+
+    options["query"] = st.text_area(
+        "SQLクエリ",
+        value=str(options.get("query", "")),
+        height=140,
+        key=f"sql_query_{table_id}",
+        help="例: SELECT * FROM table_name",
+    )
+    cfg.source_options = options
+    return cfg
+
+
+def _render_pi_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
+    """Render PI AF SDK source settings editor."""
+    source_kind = str(cfg.source_kind)
+    options = _default_source_options(source_kind)
+    options.update(dict(cfg.source_options or {}))
+
+    col1, col2 = st.columns(2)
+    with col1:
+        options["pi_server"] = st.text_input(
+            "PIサーバー名（任意）",
+            value=str(options.get("pi_server", "")),
+            key=f"pi_server_{table_id}",
+        )
+        options["af_server"] = st.text_input(
+            "AFサーバー名（任意）",
+            value=str(options.get("af_server", "")),
+            key=f"af_server_{table_id}",
+        )
+    with col2:
+        options["af_database"] = st.text_input(
+            "AFデータベース名",
+            value=str(options.get("af_database", "")),
+            key=f"af_database_{table_id}",
+        )
+        options["max_rows_per_tag"] = int(
+            st.number_input(
+                "最大行数（タグ/属性/検索）",
+                min_value=1,
+                max_value=500000,
+                value=int(options.get("max_rows_per_tag", 10000) or 10000),
+                step=100,
+                key=f"pi_max_rows_{table_id}",
+            )
+        )
+
+    if source_kind in {"pi_da_tag", "af_attribute"}:
+        query_type = normalize_pi_query_type(str(options.get("query_type", "recorded")))
+        options["query_type"] = st.selectbox(
+            "取得種別",
+            options=PI_QUERY_TYPE_OPTIONS,
+            index=PI_QUERY_TYPE_OPTIONS.index(query_type) if query_type in PI_QUERY_TYPE_OPTIONS else 0,
+            key=f"pi_query_type_{table_id}",
+        )
+        t1, t2, t3 = st.columns(3)
+        with t1:
+            options["start_time"] = st.text_input(
+                "開始時刻",
+                value=str(options.get("start_time", "*-1d")),
+                key=f"pi_start_{table_id}",
+            )
+        with t2:
+            options["end_time"] = st.text_input(
+                "終了時刻",
+                value=str(options.get("end_time", "*")),
+                key=f"pi_end_{table_id}",
+            )
+        with t3:
+            options["interval"] = st.text_input(
+                "間隔（補間/集計）",
+                value=str(options.get("interval", "1h")),
+                key=f"pi_interval_{table_id}",
+            )
+
+        summary_default = options.get("summary_functions", ["average", "min", "max"])
+        if not isinstance(summary_default, list):
+            summary_default = [str(v) for v in summary_default] if isinstance(summary_default, tuple) else ["average"]
+        options["summary_functions"] = st.multiselect(
+            "Summary関数",
+            options=PI_SUMMARY_FUNCTION_OPTIONS,
+            default=[v for v in summary_default if v in PI_SUMMARY_FUNCTION_OPTIONS],
+            key=f"pi_summary_fns_{table_id}",
+        )
+
+    if source_kind == "pi_da_tag":
+        options["tags_text"] = st.text_area(
+            "PIタグ（改行・カンマ区切り）",
+            value=str(options.get("tags_text", "")),
+            height=100,
+            key=f"pi_tags_{table_id}",
+        )
+    elif source_kind == "af_attribute":
+        e1, e2 = st.columns(2)
+        with e1:
+            options["af_element"] = st.text_input(
+                "AFエレメント名",
+                value=str(options.get("af_element", "")),
+                key=f"af_element_{table_id}",
+            )
+        with e2:
+            options["af_attributes_text"] = st.text_area(
+                "AF属性名（改行・カンマ区切り）",
+                value=str(options.get("af_attributes_text", "")),
+                height=100,
+                key=f"af_attributes_{table_id}",
+            )
+    elif source_kind == "af_event_frame":
+        ef1, ef2 = st.columns(2)
+        with ef1:
+            options["ef_template"] = st.text_input(
+                "イベントフレームテンプレート",
+                value=str(options.get("ef_template", "")),
+                key=f"af_ef_template_{table_id}",
+            )
+            options["start_time"] = st.text_input(
+                "開始時刻",
+                value=str(options.get("start_time", "*-1d")),
+                key=f"af_ef_start_{table_id}",
+            )
+        with ef2:
+            options["ef_analyses_text"] = st.text_area(
+                "イベント生成分析名（改行・カンマ区切り）",
+                value=str(options.get("ef_analyses_text", "")),
+                height=100,
+                key=f"af_ef_analyses_{table_id}",
+            )
+            options["end_time"] = st.text_input(
+                "終了時刻",
+                value=str(options.get("end_time", "*")),
+                key=f"af_ef_end_{table_id}",
+            )
+
+    if st.button("PI設定を検証", key=f"pi_validate_{table_id}", use_container_width=False):
+        try:
+            _ = build_pi_query_config(
+                data_source=source_kind,
+                pi_server=options.get("pi_server"),
+                af_server=options.get("af_server"),
+                af_database=options.get("af_database"),
+                query_type=options.get("query_type"),
+                tags_text=options.get("tags_text"),
+                af_element=options.get("af_element"),
+                af_attributes_text=options.get("af_attributes_text"),
+                start_time=options.get("start_time"),
+                end_time=options.get("end_time"),
+                interval=options.get("interval"),
+                summary_functions=options.get("summary_functions"),
+                max_rows_per_tag=options.get("max_rows_per_tag"),
+                ef_template=options.get("ef_template"),
+                ef_analyses_text=options.get("ef_analyses_text"),
+            )
+            st.success("PI設定は妥当です。")
+        except Exception as exc:
+            st.error(f"PI設定エラー: {exc}")
+
+    cfg.source_options = options
+    return cfg
+
+
 def _render_table_management(
     uploaded_map: dict[str, dict[str, Any]]
 ) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
@@ -351,13 +767,19 @@ def _render_table_management(
     st.subheader("入力テーブル")
     st.caption("読み込み設定（文字コード・シート・ヘッダ行・型）を調整し、結合前データを確認します。")
     if not table_cfgs:
-        st.info("サイドバーから CSV / Excel ファイルをアップロードしてください。")
+        st.info("サイドバーから CSV/Excel をアップロードするか、外部データソース追加ボタンで SQL / PI テーブルを追加してください。")
         return previews, preview_errors
 
     for idx, table_id in enumerate(sorted(table_cfgs.keys())):
         cfg = TableConfig.from_dict(table_cfgs[table_id])
-        uploaded = uploaded_map.get(table_id)
-        status = "アップロード済み" if uploaded else "未アップロード"
+        cfg = _ensure_source_options_defaults(cfg)
+        source_kind = str(cfg.source_kind)
+        uploaded = uploaded_map.get(table_id) if is_file_source(source_kind) else None
+        if is_file_source(source_kind):
+            status = "アップロード済み" if uploaded else "未アップロード"
+        else:
+            status = "外部データソース"
+
         with st.expander(f"{cfg.table_name} ({cfg.source_file_name}) - {status}", expanded=idx == 0):
             cfg.table_name = st.text_input(
                 "テーブル名",
@@ -370,14 +792,13 @@ def _render_table_management(
                 key=f"normalize_columns_{table_id}",
             )
 
-            if not uploaded:
+            if is_file_source(source_kind) and not uploaded:
                 st.warning("このテーブルに対応するファイルが現在アップロードされていません。レシピから読み込んだ可能性があります。")
                 _update_table_config_in_state(cfg)
                 continue
 
-            raw_bytes = uploaded["bytes"]
-
-            if cfg.source_kind == "csv":
+            if source_kind == "csv":
+                raw_bytes = uploaded["bytes"] if uploaded else b""
                 detected = detect_csv_options(raw_bytes)
                 csv_col1, csv_col2 = st.columns(2)
                 with csv_col1:
@@ -419,9 +840,10 @@ def _render_table_management(
                             key=f"csv_header_row_{table_id}",
                         )
                     )
-            else:
+            elif source_kind == "excel":
+                raw_bytes = uploaded["bytes"] if uploaded else b""
                 try:
-                    sheet_names = list_excel_sheets(raw_bytes)
+                    sheet_names = list_excel_sheets(raw_bytes, cfg.source_file_name)
                 except Exception as exc:
                     preview_errors[table_id] = str(exc)
                     _show_exception(f"Excel設定読み込みエラー ({cfg.table_name})", exc if isinstance(exc, Exception) else Exception(str(exc)))
@@ -452,13 +874,22 @@ def _render_table_management(
                             key=f"excel_header_row_{table_id}",
                         )
                     )
+            elif source_kind == SQL_SOURCE_KIND:
+                st.caption("SQL接続情報とSQL文を設定します。必要に応じてテーブル一覧からSELECT文を生成できます。")
+                cfg = _render_sql_source_options(cfg, table_id)
+            elif source_kind in PI_SOURCE_KINDS:
+                st.caption("PI AF SDK の取得条件を設定します。タグ/属性/イベントフレームのいずれかを指定してください。")
+                cfg = _render_pi_source_options(cfg, table_id)
+            else:
+                st.error(f"未対応のデータソース種別です: {source_kind}")
+                _update_table_config_in_state(cfg)
+                continue
 
             try:
-                raw_preview = read_raw_table(raw_bytes, cfg, nrows=preview_rows)
                 # Build a temporary preview to derive column candidates before selection is applied.
                 temp_cfg = TableConfig.from_dict(cfg.to_dict())
                 temp_cfg.selected_columns = []
-                normalized_preview = load_table_bytes(raw_bytes, temp_cfg, nrows=preview_rows)
+                normalized_preview = load_table_from_source(temp_cfg, uploaded_entry=uploaded, nrows=preview_rows)
                 all_columns = [str(c) for c in normalized_preview.columns]
                 cfg = _sanitize_columns_for_table(cfg, all_columns)
                 if not cfg.selected_columns:
@@ -501,7 +932,7 @@ def _render_table_management(
                             else:
                                 cfg.dtype_overrides[col_name] = selected_override  # type: ignore[assignment]
 
-                prepared_preview = load_table_bytes(raw_bytes, cfg, nrows=preview_rows)
+                prepared_preview = load_table_from_source(cfg, uploaded_entry=uploaded, nrows=preview_rows)
                 previews[table_id] = prepared_preview
                 st.caption(f"プレビュー（先頭 {preview_rows} 行）: {prepared_preview.shape[0]} 行 x {prepared_preview.shape[1]} 列")
                 st.dataframe(prepared_preview.head(preview_rows), use_container_width=True, height=300)
@@ -638,7 +1069,7 @@ def _render_join_plan_sidebar(
     st.sidebar.subheader("結合・縦連結の手順")
     st.sidebar.caption("手順は上から順に適用されます。ベーステーブルに対して段階的に設定してください。")
     if not table_ids:
-        st.sidebar.info("ファイルをアップロードするとステップを編集できます。")
+        st.sidebar.info("テーブルを1件以上追加すると手順を編集できます。")
         return False
 
     base_labels = {tid: _table_label(tid, table_cfgs, uploaded_map) for tid in table_ids}
@@ -973,14 +1404,14 @@ def _load_table_for_execution(
     table_cfgs = st.session_state["table_configs"]
     if table_id not in table_cfgs:
         raise UserInputError(f"テーブル定義が見つかりません: {table_id}")
-    if table_id not in uploaded_map:
-        cfg = TableConfig.from_dict(table_cfgs[table_id])
+    cfg = TableConfig.from_dict(table_cfgs[table_id])
+    cfg = _ensure_source_options_defaults(cfg)
+    uploaded = uploaded_map.get(table_id) if is_file_source(str(cfg.source_kind)) else None
+    if is_file_source(str(cfg.source_kind)) and uploaded is None:
         raise UserInputError(
             f"テーブル '{cfg.table_name}' ({cfg.source_file_name}) のファイルがアップロードされていません。"
         )
-    cfg = TableConfig.from_dict(table_cfgs[table_id])
-    raw_bytes = uploaded_map[table_id]["bytes"]
-    df = load_table_bytes(raw_bytes, cfg, nrows=None)
+    df = load_table_from_source(cfg, uploaded_entry=uploaded, nrows=None)
     cache[table_id] = df
     return df
 
@@ -1185,14 +1616,14 @@ def run() -> None:
 
     st.title("DataStitcher")
     st.caption(
-        "複数の CSV / XLSX を多段の結合（横方向）・時系列近傍結合（asof）・縦連結（Union）で統合し、CSV / Excel として出力します。"
+        "CSV / Excel / SQLデータベース / PI AF SDK のデータを多段の結合（横方向）・時系列近傍結合（asof）・縦連結（Union）で統合し、CSV / Excel として出力します。"
     )
     st.info("使い方: 1) ファイルをアップロードして設定 2) 手順を作成 3) 処理を実行して結果を保存")
 
     st.sidebar.header("操作メニュー")
     uploaded_files = st.sidebar.file_uploader(
-        "ファイルをアップロード (CSV / XLSX 混在可)",
-        type=["csv", "xlsx"],
+        "ファイルをアップロード (CSV / XLSX / XLS / XLSM 混在可)",
+        type=["csv", "xlsx", "xls", "xlsm"],
         accept_multiple_files=True,
         key="data_files_uploader",
     )
@@ -1208,6 +1639,7 @@ def run() -> None:
     )
 
     uploaded_map = _sync_uploaded_files(uploaded_files or [])
+    _render_source_registration_sidebar()
 
     st.sidebar.caption(
         f"アップロード済み: {len(uploaded_map)} 件 / テーブル定義: {len(st.session_state['table_configs'])} 件"
