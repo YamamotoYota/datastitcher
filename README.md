@@ -14,6 +14,19 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+## 実行ファイル作成（PyInstaller）
+
+`DataStitcher.exe` を作成する場合は、以下を実行します。
+
+```powershell
+.\build_exe.ps1
+```
+
+出力先:
+- `dist\DataStitcher\DataStitcher.exe`
+
+起動後はローカルの Streamlit サーバー（既定: `http://localhost:8501`）で画面を操作します。
+
 ## 使い方
 
 1. サイドバーから入力テーブルを追加
