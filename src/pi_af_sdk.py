@@ -5,8 +5,14 @@
 
 from __future__ import annotations
 
+import importlib
+import os
+import platform
 import re
+import struct
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -77,6 +83,7 @@ def parse_name_list(raw_text: str | None) -> tuple[str, ...]:
 def parse_tag_list(raw_text: str | None) -> tuple[str, ...]:
     """Backward-compatible alias for tag list parser."""
     return parse_name_list(raw_text)
+
 def normalize_max_rows(value: int | float | str | None, default_value: int = 10000) -> int:
     """Normalize per-target maximum row count."""
     if value in (None, ""):
@@ -174,28 +181,264 @@ def _validate_query_config(config: PIQueryConfig) -> None:
     raise PIDataError(f"未対応のPIデータ取得モードです: {config.data_source}")
 
 
+def _python_bitness() -> int:
+    """Return current Python process bitness."""
+    return struct.calcsize("P") * 8
+
+
+def _runtime_name(runtime_info: Any) -> str:
+    """Best-effort runtime name extraction from pythonnet runtime info."""
+    if runtime_info is None:
+        return ""
+
+    for attr in ("name", "runtime", "kind"):
+        try:
+            value = getattr(runtime_info, attr, None)
+        except Exception:
+            value = None
+        if value:
+            return str(value).strip().lower()
+
+    text = str(runtime_info).strip().lower()
+    if "coreclr" in text:
+        return "coreclr"
+    if "netfx" in text or ".net framework" in text:
+        return "netfx"
+    return ""
+
+
+def _afsdk_dll_candidates() -> list[Path]:
+    """Build candidate paths for OSIsoft.AFSDK.dll."""
+    roots: list[Path] = []
+
+    def _add_root(raw: str | None) -> None:
+        if not raw:
+            return
+        path = Path(str(raw)).expanduser()
+        if path not in roots:
+            roots.append(path)
+
+    _add_root(os.environ.get("PIPC"))
+    _add_root(os.environ.get("PIHOME"))
+    _add_root(os.environ.get("PIHOME64"))
+    _add_root(os.environ.get("ProgramFiles"))
+    _add_root(os.environ.get("ProgramFiles(x86)"))
+
+    for known_root in (
+        Path(r"C:\Program Files\PIPC"),
+        Path(r"C:\Program Files (x86)\PIPC"),
+        Path(r"C:\Program Files\OSIsoft"),
+        Path(r"C:\Program Files (x86)\OSIsoft"),
+        Path(r"C:\Program Files\AVEVA\PI System"),
+        Path(r"C:\Program Files (x86)\AVEVA\PI System"),
+    ):
+        _add_root(str(known_root))
+
+    candidates: list[Path] = []
+
+    def _add_candidate(path: Path) -> None:
+        try:
+            exists = path.exists() and path.is_file()
+        except Exception:
+            exists = False
+        if exists and path not in candidates:
+            candidates.append(path)
+
+    for root in roots:
+        _add_candidate(root / "AF" / "PublicAssemblies" / "4.0" / "OSIsoft.AFSDK.dll")
+        _add_candidate(root / "PIPC" / "AF" / "PublicAssemblies" / "4.0" / "OSIsoft.AFSDK.dll")
+        _add_candidate(root / "OSIsoft" / "AF" / "PublicAssemblies" / "4.0" / "OSIsoft.AFSDK.dll")
+        _add_candidate(root / "AVEVA" / "PI System" / "AF" / "PublicAssemblies" / "4.0" / "OSIsoft.AFSDK.dll")
+
+    return candidates
+
+
+def _infer_pipc_root_from_dll(dll_path: Path) -> Path | None:
+    """Infer PIPC root directory from AFSDK DLL path."""
+    lowered_parts = [part.lower() for part in dll_path.parts]
+    if "pipc" not in lowered_parts:
+        return None
+    idx = lowered_parts.index("pipc")
+    if idx < 0:
+        return None
+    try:
+        return Path(*dll_path.parts[: idx + 1])
+    except Exception:
+        return None
+
+
+def _prepare_afsdk_environment() -> None:
+    """Prepare process-level env vars for robust AF SDK loading."""
+    if not os.environ.get("PYTHONNET_RUNTIME"):
+        os.environ["PYTHONNET_RUNTIME"] = "netfx"
+
+    candidates = _afsdk_dll_candidates()
+    parent_dirs = [str(path.parent) for path in candidates if path.parent]
+
+    current_path = os.environ.get("PATH", "")
+    parts = [part for part in current_path.split(os.pathsep) if part]
+    lowered = {part.lower() for part in parts}
+
+    for directory in parent_dirs:
+        if directory.lower() in lowered:
+            continue
+        parts.insert(0, directory)
+        lowered.add(directory.lower())
+
+    if parts:
+        os.environ["PATH"] = os.pathsep.join(parts)
+
+    if not os.environ.get("PIPC"):
+        for dll_path in candidates:
+            pipc_root = _infer_pipc_root_from_dll(dll_path)
+            if pipc_root is not None:
+                os.environ["PIPC"] = str(pipc_root)
+                break
+
+
+def _import_afsdk_symbol(
+    symbol_name: str,
+    namespaces: tuple[str, ...],
+    *,
+    required: bool = True,
+) -> Any:
+    """Import AF SDK symbol from candidate namespaces."""
+    errors: list[str] = []
+    for module_name in namespaces:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            errors.append(f"{module_name}: {type(exc).__name__}: {exc}")
+            continue
+
+        symbol = getattr(module, symbol_name, None)
+        if symbol is not None:
+            return symbol
+        errors.append(f"{module_name}: {symbol_name} が見つかりません")
+
+    if not required:
+        return None
+
+    detail = " | ".join(errors[:4]) if errors else "候補namespaceなし"
+    raise PIDataError(
+        f"AF SDK型の読み込みに失敗しました: {symbol_name}. "
+        f"候補={', '.join(namespaces)}. 詳細={detail}"
+    )
+
+
+def _add_afsdk_reference(clr: Any, runtime_info: Any) -> str:
+    """Add AF SDK assembly reference with absolute-path fallback."""
+    try:
+        clr.AddReference("OSIsoft.AFSDK")
+        return "OSIsoft.AFSDK"
+    except Exception as short_exc:
+        short_detail = f"{type(short_exc).__name__}: {short_exc}"
+
+    candidates = _afsdk_dll_candidates()
+    fallback_errors: list[str] = []
+
+    for dll_path in candidates:
+        try:
+            clr.AddReference(str(dll_path))
+            return str(dll_path)
+        except Exception as exc:
+            fallback_errors.append(f"{dll_path} -> {type(exc).__name__}: {exc}")
+
+    lines: list[str] = [
+        "OSIsoft.AFSDK の参照に失敗しました。",
+        f"- 短縮名参照エラー: {short_detail}",
+        f"- Python実行ファイル: {sys.executable}",
+        f"- Pythonビット数: {_python_bitness()}bit",
+        f"- OS: {platform.platform()}",
+        f"- pythonnet runtime: {runtime_info}",
+    ]
+
+    if candidates:
+        lines.append("- 探索した DLL パス:")
+        lines.extend([f"  - {path}" for path in candidates])
+    else:
+        lines.append("- OSIsoft.AFSDK.dll の候補パスが見つかりませんでした。")
+
+    if fallback_errors:
+        lines.append("- DLL直接参照のエラー（先頭3件）:")
+        lines.extend([f"  - {err}" for err in fallback_errors[:3]])
+
+    lines.append("- 対処: PI AF Client導入、x64/x86一致、`PYTHONNET_RUNTIME=netfx` を確認してください。")
+    raise PIDataError("\n".join(lines))
+
+
 def _load_af_sdk() -> dict[str, Any]:
-    """Load AF SDK types through pythonnet."""
+    """Load AF SDK types through pythonnet with netfx and path fallback."""
+    _prepare_afsdk_environment()
+
+    try:
+        from pythonnet import get_runtime_info, load
+    except ImportError as exc:  # pragma: no cover
+        raise PIDataError("PI AF SDKの利用には `pythonnet` が必要です。") from exc
+
+    runtime_info: Any = None
+    try:
+        runtime_info = get_runtime_info()
+    except Exception:
+        runtime_info = None
+
+    if runtime_info is None:
+        try:
+            load("netfx")
+        except Exception as exc:  # pragma: no cover
+            raise PIDataError(
+                "pythonnet runtime の初期化に失敗しました。`netfx` (.NET Framework) で実行できる環境か確認してください。"
+                f" 詳細: {type(exc).__name__}: {exc}"
+            ) from exc
+        try:
+            runtime_info = get_runtime_info()
+        except Exception:
+            runtime_info = "netfx (runtime info unavailable)"
+
+    runtime_name = _runtime_name(runtime_info)
+    if runtime_name and runtime_name != "netfx":
+        raise PIDataError(
+            "pythonnet runtime が netfx ではありません。AF SDK は .NET Framework (netfx) で実行してください。"
+            f" 現在: {runtime_info}. 環境変数 `PYTHONNET_RUNTIME=netfx` を設定して再実行してください。"
+        )
+
     try:
         import clr  # type: ignore
     except ImportError as exc:  # pragma: no cover
         raise PIDataError("PI AF SDKの利用には `pythonnet` が必要です。") from exc
 
-    try:
-        clr.AddReference("OSIsoft.AFSDK")
-    except Exception as exc:  # pragma: no cover
-        raise PIDataError(
-            "OSIsoft.AFSDK を読み込めません。PI AF Client（PI System Explorer）をインストールしてください。"
-        ) from exc
+    reference_hint = _add_afsdk_reference(clr, runtime_info)
 
     try:
-        from OSIsoft.AF import AFTime, AFTimeRange, AFTimeSpan  # type: ignore
-        from OSIsoft.AF.Asset import AFElement, AFElementSearch, AFServers  # type: ignore
-        from OSIsoft.AF.Data import AFBoundaryType  # type: ignore
-        from OSIsoft.AF.EventFrame import AFEventFrameSearch  # type: ignore
-        from OSIsoft.AF.PI import PIPoint, PIServers  # type: ignore
+        AFTime = _import_afsdk_symbol("AFTime", ("OSIsoft.AF.Time", "OSIsoft.AF"))
+        AFTimeRange = _import_afsdk_symbol("AFTimeRange", ("OSIsoft.AF.Time", "OSIsoft.AF"))
+        AFTimeSpan = _import_afsdk_symbol("AFTimeSpan", ("OSIsoft.AF.Time", "OSIsoft.AF"))
+        AFElement = _import_afsdk_symbol("AFElement", ("OSIsoft.AF.Asset",))
+        AFElementSearch = _import_afsdk_symbol("AFElementSearch", ("OSIsoft.AF.Search", "OSIsoft.AF.Asset"))
+        AFBoundaryType = _import_afsdk_symbol("AFBoundaryType", ("OSIsoft.AF.Data",))
+        AFEventFrameSearch = _import_afsdk_symbol("AFEventFrameSearch", ("OSIsoft.AF.Search", "OSIsoft.AF.EventFrame"))
+        PIPoint = _import_afsdk_symbol("PIPoint", ("OSIsoft.AF.PI",))
+        PIServers = _import_afsdk_symbol("PIServers", ("OSIsoft.AF.PI",))
+
+        PISystems = _import_afsdk_symbol("PISystems", ("OSIsoft.AF",), required=False)
+        AFServers = _import_afsdk_symbol("AFServers", ("OSIsoft.AF", "OSIsoft.AF.Asset"), required=False)
+
+        if PISystems is not None:
+            af_server_collection_factory = PISystems
+            af_server_collection_name = "PISystems"
+        elif AFServers is not None:
+            af_server_collection_factory = AFServers
+            af_server_collection_name = "AFServers"
+        else:
+            raise PIDataError(
+                "AFサーバー集合型が見つかりませんでした。PISystems/AFServers のいずれも利用不可です。"
+            )
+
     except Exception as exc:  # pragma: no cover
-        raise PIDataError("AF SDK API の読み込みに失敗しました。AF SDK バージョンを確認してください。") from exc
+        raise PIDataError(
+            "AF SDK API の読み込みに失敗しました。"
+            f" 参照元={reference_hint}, runtime={runtime_info}, 詳細={type(exc).__name__}: {exc}"
+        ) from exc
 
     return {
         "AFTime": AFTime,
@@ -204,12 +447,12 @@ def _load_af_sdk() -> dict[str, Any]:
         "AFBoundaryType": AFBoundaryType,
         "PIPoint": PIPoint,
         "PIServers": PIServers,
-        "AFServers": AFServers,
+        "AFServerCollectionFactory": af_server_collection_factory,
+        "AFServerCollectionName": af_server_collection_name,
         "AFElement": AFElement,
         "AFElementSearch": AFElementSearch,
         "AFEventFrameSearch": AFEventFrameSearch,
     }
-
 
 def _resolve_named_server(servers: Any, server_name: str, *, kind_label: str) -> Any:
     """Resolve server by explicit name or default server."""
@@ -222,9 +465,12 @@ def _resolve_named_server(servers: Any, server_name: str, *, kind_label: str) ->
                     return server
             raise PIDataError(f"{kind_label}サーバーが見つかりません: {server_name}")
 
-    default_server = getattr(servers, "DefaultPIServer", None)
-    if default_server is None:
-        default_server = getattr(servers, "DefaultAFServer", None)
+    default_server: Any = None
+    for attr in ("DefaultPIServer", "DefaultAFServer", "DefaultPISystem", "Default"):
+        default_server = getattr(servers, attr, None)
+        if default_server is not None:
+            break
+
     if default_server is None:
         raise PIDataError(f"既定の{kind_label}サーバーが見つかりません。サーバー名を入力してください。")
     return default_server
@@ -611,8 +857,8 @@ def _fetch_pi_da_tag_rows(config: PIQueryConfig, sdk: dict[str, Any]) -> list[di
 
 def _fetch_af_attribute_rows(config: PIQueryConfig, sdk: dict[str, Any]) -> list[dict[str, Any]]:
     """Fetch AF attribute rows in PI tag-like row format."""
-    AFServers = sdk["AFServers"]
-    af_server = _resolve_named_server(AFServers(), config.af_server, kind_label="AF")
+    af_server_collection_factory = sdk["AFServerCollectionFactory"]
+    af_server = _resolve_named_server(af_server_collection_factory(), config.af_server, kind_label="AF")
     _connect_server(af_server, label="AFサーバー")
     af_database = _resolve_af_database(af_server, config.af_database)
     element = _resolve_af_element(af_database, config.af_element, sdk)
@@ -622,7 +868,7 @@ def _fetch_af_attribute_rows(config: PIQueryConfig, sdk: dict[str, Any]) -> list
     errors: list[str] = []
 
     for attribute_name in config.af_attributes:
-        tag_name = f"{config.af_element}|{attribute_name}"
+        tag_name = attribute_name
         try:
             attribute = _resolve_af_attribute(element, attribute_name)
             if query_type == "snapshot":
@@ -711,10 +957,10 @@ def _match_any_analysis(required: tuple[str, ...], available: tuple[str, ...]) -
 
 def _fetch_af_event_frame_rows(config: PIQueryConfig, sdk: dict[str, Any]) -> list[dict[str, Any]]:
     """Fetch AF event frame rows filtered by template, time range, and analysis names."""
-    AFServers = sdk["AFServers"]
+    af_server_collection_factory = sdk["AFServerCollectionFactory"]
     AFEventFrameSearch = sdk["AFEventFrameSearch"]
 
-    af_server = _resolve_named_server(AFServers(), config.af_server, kind_label="AF")
+    af_server = _resolve_named_server(af_server_collection_factory(), config.af_server, kind_label="AF")
     _connect_server(af_server, label="AFサーバー")
     af_database = _resolve_af_database(af_server, config.af_database)
 
@@ -771,6 +1017,38 @@ def _fetch_af_event_frame_rows(config: PIQueryConfig, sdk: dict[str, Any]) -> li
     return rows
 
 
+def _to_wide_series_table(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert long PI/AF rows (`tag`, `value`) into wide table (columns by tag/attribute)."""
+    if frame.empty or "tag" not in frame.columns or "value" not in frame.columns:
+        return frame
+
+    if "timestamp" in frame.columns:
+        index_cols = ["timestamp"]
+    elif "window_start" in frame.columns:
+        index_cols = [col for col in ("window_start", "window_end", "summary") if col in frame.columns]
+    else:
+        return frame
+
+    work = frame.copy()
+    work["tag"] = work["tag"].astype(str)
+    work = work[index_cols + ["tag", "value"]]
+
+    wide = work.pivot_table(
+        index=index_cols,
+        columns="tag",
+        values="value",
+        aggfunc="first",
+    ).reset_index()
+
+    if isinstance(wide.columns, pd.MultiIndex):
+        wide.columns = [
+            str(col[-1]) if isinstance(col, tuple) else str(col)
+            for col in wide.columns
+        ]
+
+    return wide
+
+
 def fetch_pi_datalink_table(config: PIQueryConfig) -> pd.DataFrame:
     """Fetch PI/AF data table based on query mode."""
     _validate_query_config(config)
@@ -789,5 +1067,10 @@ def fetch_pi_datalink_table(config: PIQueryConfig) -> pd.DataFrame:
     for col in ("timestamp", "window_start", "window_end", "start_time", "end_time"):
         if col in frame.columns:
             frame[col] = pd.to_datetime(frame[col], errors="coerce")
+
+    if config.data_source in {"pi_da_tag", "af_attribute"}:
+        frame = _to_wide_series_table(frame)
+
     return frame
+
 
