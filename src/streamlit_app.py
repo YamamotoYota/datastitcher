@@ -470,7 +470,7 @@ def _render_source_registration_sidebar() -> None:
     st.sidebar.caption("SQLデータベースや PI AF SDK から読み込むテーブルを追加できます。")
     st.sidebar.caption(
         "PI DA追加=PIタグ, AF属性追加=AF属性, AFイベント追加=イベントフレーム。"
-        " 追加後にテーブル設定内の「PI取得対象」でいつでも切替できます。"
+        " 取得種別を変える場合は、目的の種別でテーブルを追加してください。"
     )
 
     c1, c2 = st.sidebar.columns(2)
@@ -623,44 +623,17 @@ def _render_pi_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
         "af_attribute": "AFデータベース内のエレメント属性値を、PIタグ相当の時系列形式で取得します。",
         "af_event_frame": "AFイベントフレームをテンプレート・期間・イベント生成分析名で抽出します。",
     }
-    mode_options = list(mode_labels.keys())
-
     source_kind = str(cfg.source_kind)
-    current_mode = source_kind if source_kind in mode_options else "pi_da_tag"
-    base_options = dict(cfg.source_options or {})
-
-    selected_mode = st.selectbox(
-        "PI取得対象",
-        options=mode_options,
-        index=mode_options.index(current_mode),
-        key=f"pi_mode_{table_id}",
-        format_func=lambda v: mode_labels[v],
-    )
-
-    if selected_mode != current_mode:
-        carry_keys = {
-            "pi_server",
-            "af_server",
-            "af_database",
-            "start_time",
-            "end_time",
-            "interval",
-            "summary_functions",
-            "max_rows_per_tag",
-        }
-        fresh = _default_source_options(selected_mode)
-        for key in carry_keys:
-            if key in base_options:
-                fresh[key] = base_options[key]
-        cfg.source_kind = selected_mode  # type: ignore[assignment]
-        cfg.source_file_name = _default_source_file_name(selected_mode)
-        source_kind = selected_mode
-        base_options = fresh
+    if source_kind not in mode_labels:
+        source_kind = "pi_da_tag"
+        cfg.source_kind = source_kind  # type: ignore[assignment]
+        cfg.source_file_name = _default_source_file_name(source_kind)
 
     options = _default_source_options(source_kind)
-    options.update(base_options)
+    options.update(dict(cfg.source_options or {}))
 
     st.info(f"{mode_labels[source_kind]}: {mode_descriptions[source_kind]}")
+    st.caption("取得種別はサイドバーで追加したテーブル種別で固定です。")
     st.caption("名前一覧は改行・カンマ・セミコロン・読点（、）区切りで入力できます。")
 
     options["max_rows_per_tag"] = int(
