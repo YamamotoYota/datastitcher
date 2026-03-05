@@ -60,6 +60,8 @@ streamlit run app.py
   - PI DAタグ: Snapshot / Recorded / Interpolated / Summary
   - PI AF属性: エレメント名 + 属性名で取得（PI DAタグ同様の行形式）
   - PI AFイベントフレーム: テンプレート + 対象期間 + イベント生成分析名で取得
+  - 取得対象は UI の「PI取得対象」で明示選択可能（PIタグ / AF属性 / イベントフレーム）
+  - 日本語名（データベース名、エレメント名、属性名）や全角入力を正規化して処理
 
 ### 結合・縦連結
 - 多段手順（ベーステーブル → 手順1 → 手順2 ...）
@@ -138,6 +140,7 @@ logs/
 ## 制限事項
 
 - PI AF SDK は実行環境に `pythonnet` と `OSIsoft.AFSDK` が必要
+- pythonnet runtime は自動調整を試行します（`netfx` 固定エラーは出ない実装）
 - SQL接続は各DBのドライバ・ネットワーク到達性に依存
 - `asof join` は `left join` のみ対応
 - `union` 列名推定はヒューリスティック（必要に応じて手動修正）

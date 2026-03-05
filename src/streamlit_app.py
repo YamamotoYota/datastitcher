@@ -468,6 +468,10 @@ def _render_source_registration_sidebar() -> None:
     """Render quick-add buttons for non-file data sources."""
     st.sidebar.subheader("外部データソース追加")
     st.sidebar.caption("SQLデータベースや PI AF SDK から読み込むテーブルを追加できます。")
+    st.sidebar.caption(
+        "PI DA追加=PIタグ, AF属性追加=AF属性, AFイベント追加=イベントフレーム。"
+        " 追加後にテーブル設定内の「PI取得対象」でいつでも切替できます。"
+    )
 
     c1, c2 = st.sidebar.columns(2)
     with c1:
@@ -609,102 +613,164 @@ def _render_sql_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
 
 def _render_pi_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
     """Render PI AF SDK source settings editor."""
+    mode_labels = {
+        "pi_da_tag": "PI DAサーバーのPIタグデータ",
+        "af_attribute": "PI AFサーバーのAF属性データ",
+        "af_event_frame": "PI AFサーバーのイベントフレームデータ",
+    }
+    mode_descriptions = {
+        "pi_da_tag": "PI Data Archive からタグ値（Snapshot/Recorded/Interpolated/Summary）を取得します。",
+        "af_attribute": "AFデータベース内のエレメント属性値を、PIタグ相当の時系列形式で取得します。",
+        "af_event_frame": "AFイベントフレームをテンプレート・期間・イベント生成分析名で抽出します。",
+    }
+    mode_options = list(mode_labels.keys())
+
     source_kind = str(cfg.source_kind)
+    current_mode = source_kind if source_kind in mode_options else "pi_da_tag"
+    base_options = dict(cfg.source_options or {})
+
+    selected_mode = st.selectbox(
+        "PI取得対象",
+        options=mode_options,
+        index=mode_options.index(current_mode),
+        key=f"pi_mode_{table_id}",
+        format_func=lambda v: mode_labels[v],
+    )
+
+    if selected_mode != current_mode:
+        carry_keys = {
+            "pi_server",
+            "af_server",
+            "af_database",
+            "start_time",
+            "end_time",
+            "interval",
+            "summary_functions",
+            "max_rows_per_tag",
+        }
+        fresh = _default_source_options(selected_mode)
+        for key in carry_keys:
+            if key in base_options:
+                fresh[key] = base_options[key]
+        cfg.source_kind = selected_mode  # type: ignore[assignment]
+        cfg.source_file_name = _default_source_file_name(selected_mode)
+        source_kind = selected_mode
+        base_options = fresh
+
     options = _default_source_options(source_kind)
-    options.update(dict(cfg.source_options or {}))
+    options.update(base_options)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        options["pi_server"] = st.text_input(
-            "PIサーバー名（任意）",
-            value=str(options.get("pi_server", "")),
-            key=f"pi_server_{table_id}",
+    st.info(f"{mode_labels[source_kind]}: {mode_descriptions[source_kind]}")
+    st.caption("名前一覧は改行・カンマ・セミコロン・読点（、）区切りで入力できます。")
+
+    options["max_rows_per_tag"] = int(
+        st.number_input(
+            "最大行数（タグ/属性/検索）",
+            min_value=1,
+            max_value=500000,
+            value=int(options.get("max_rows_per_tag", 10000) or 10000),
+            step=100,
+            key=f"pi_max_rows_{table_id}",
         )
-        options["af_server"] = st.text_input(
-            "AFサーバー名（任意）",
-            value=str(options.get("af_server", "")),
-            key=f"af_server_{table_id}",
-        )
-    with col2:
-        options["af_database"] = st.text_input(
-            "AFデータベース名",
-            value=str(options.get("af_database", "")),
-            key=f"af_database_{table_id}",
-        )
-        options["max_rows_per_tag"] = int(
-            st.number_input(
-                "最大行数（タグ/属性/検索）",
-                min_value=1,
-                max_value=500000,
-                value=int(options.get("max_rows_per_tag", 10000) or 10000),
-                step=100,
-                key=f"pi_max_rows_{table_id}",
+    )
+
+    if source_kind == "pi_da_tag":
+        col1, col2 = st.columns(2)
+        with col1:
+            options["pi_server"] = st.text_input(
+                "PI DAサーバー名（任意）",
+                value=str(options.get("pi_server", "")),
+                key=f"pi_server_{table_id}",
             )
-        )
-
-    if source_kind in {"pi_da_tag", "af_attribute"}:
-        query_type = normalize_pi_query_type(str(options.get("query_type", "recorded")))
-        options["query_type"] = st.selectbox(
-            "取得種別",
-            options=PI_QUERY_TYPE_OPTIONS,
-            index=PI_QUERY_TYPE_OPTIONS.index(query_type) if query_type in PI_QUERY_TYPE_OPTIONS else 0,
-            key=f"pi_query_type_{table_id}",
-        )
-        t1, t2, t3 = st.columns(3)
-        with t1:
+            options["tags_text"] = st.text_area(
+                "PIタグ一覧",
+                value=str(options.get("tags_text", "")),
+                height=100,
+                key=f"pi_tags_{table_id}",
+            )
+        with col2:
+            query_type = normalize_pi_query_type(str(options.get("query_type", "recorded")))
+            options["query_type"] = st.selectbox(
+                "取得種別",
+                options=PI_QUERY_TYPE_OPTIONS,
+                index=PI_QUERY_TYPE_OPTIONS.index(query_type) if query_type in PI_QUERY_TYPE_OPTIONS else 0,
+                key=f"pi_query_type_{table_id}",
+            )
             options["start_time"] = st.text_input(
                 "開始時刻",
                 value=str(options.get("start_time", "*-1d")),
                 key=f"pi_start_{table_id}",
             )
-        with t2:
             options["end_time"] = st.text_input(
                 "終了時刻",
                 value=str(options.get("end_time", "*")),
                 key=f"pi_end_{table_id}",
             )
-        with t3:
             options["interval"] = st.text_input(
                 "間隔（補間/集計）",
                 value=str(options.get("interval", "1h")),
                 key=f"pi_interval_{table_id}",
             )
-
-        summary_default = options.get("summary_functions", ["average", "min", "max"])
-        if not isinstance(summary_default, list):
-            summary_default = [str(v) for v in summary_default] if isinstance(summary_default, tuple) else ["average"]
-        options["summary_functions"] = st.multiselect(
-            "Summary関数",
-            options=PI_SUMMARY_FUNCTION_OPTIONS,
-            default=[v for v in summary_default if v in PI_SUMMARY_FUNCTION_OPTIONS],
-            key=f"pi_summary_fns_{table_id}",
-        )
-
-    if source_kind == "pi_da_tag":
-        options["tags_text"] = st.text_area(
-            "PIタグ（改行・カンマ区切り）",
-            value=str(options.get("tags_text", "")),
-            height=100,
-            key=f"pi_tags_{table_id}",
-        )
     elif source_kind == "af_attribute":
-        e1, e2 = st.columns(2)
-        with e1:
+        col1, col2 = st.columns(2)
+        with col1:
+            options["af_server"] = st.text_input(
+                "PI AFサーバー名（任意）",
+                value=str(options.get("af_server", "")),
+                key=f"af_server_{table_id}",
+            )
+            options["af_database"] = st.text_input(
+                "AFデータベース名",
+                value=str(options.get("af_database", "")),
+                key=f"af_database_{table_id}",
+            )
             options["af_element"] = st.text_input(
                 "AFエレメント名",
                 value=str(options.get("af_element", "")),
                 key=f"af_element_{table_id}",
             )
-        with e2:
+        with col2:
+            query_type = normalize_pi_query_type(str(options.get("query_type", "recorded")))
+            options["query_type"] = st.selectbox(
+                "取得種別",
+                options=PI_QUERY_TYPE_OPTIONS,
+                index=PI_QUERY_TYPE_OPTIONS.index(query_type) if query_type in PI_QUERY_TYPE_OPTIONS else 0,
+                key=f"pi_query_type_{table_id}",
+            )
             options["af_attributes_text"] = st.text_area(
-                "AF属性名（改行・カンマ区切り）",
+                "AF属性名一覧",
                 value=str(options.get("af_attributes_text", "")),
                 height=100,
                 key=f"af_attributes_{table_id}",
             )
-    elif source_kind == "af_event_frame":
-        ef1, ef2 = st.columns(2)
-        with ef1:
+            options["start_time"] = st.text_input(
+                "開始時刻",
+                value=str(options.get("start_time", "*-1d")),
+                key=f"pi_start_{table_id}",
+            )
+            options["end_time"] = st.text_input(
+                "終了時刻",
+                value=str(options.get("end_time", "*")),
+                key=f"pi_end_{table_id}",
+            )
+            options["interval"] = st.text_input(
+                "間隔（補間/集計）",
+                value=str(options.get("interval", "1h")),
+                key=f"pi_interval_{table_id}",
+            )
+    else:  # af_event_frame
+        col1, col2 = st.columns(2)
+        with col1:
+            options["af_server"] = st.text_input(
+                "PI AFサーバー名（任意）",
+                value=str(options.get("af_server", "")),
+                key=f"af_server_{table_id}",
+            )
+            options["af_database"] = st.text_input(
+                "AFデータベース名",
+                value=str(options.get("af_database", "")),
+                key=f"af_database_{table_id}",
+            )
             options["ef_template"] = st.text_input(
                 "イベントフレームテンプレート",
                 value=str(options.get("ef_template", "")),
@@ -715,9 +781,9 @@ def _render_pi_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
                 value=str(options.get("start_time", "*-1d")),
                 key=f"af_ef_start_{table_id}",
             )
-        with ef2:
+        with col2:
             options["ef_analyses_text"] = st.text_area(
-                "イベント生成分析名（改行・カンマ区切り）",
+                "イベント生成分析名一覧",
                 value=str(options.get("ef_analyses_text", "")),
                 height=100,
                 key=f"af_ef_analyses_{table_id}",
@@ -727,6 +793,17 @@ def _render_pi_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
                 value=str(options.get("end_time", "*")),
                 key=f"af_ef_end_{table_id}",
             )
+
+    if source_kind in {"pi_da_tag", "af_attribute"}:
+        summary_default = options.get("summary_functions", ["average", "min", "max"])
+        if not isinstance(summary_default, list):
+            summary_default = [str(v) for v in summary_default] if isinstance(summary_default, tuple) else ["average"]
+        options["summary_functions"] = st.multiselect(
+            "Summary関数（summary選択時）",
+            options=PI_SUMMARY_FUNCTION_OPTIONS,
+            default=[v for v in summary_default if v in PI_SUMMARY_FUNCTION_OPTIONS],
+            key=f"pi_summary_fns_{table_id}",
+        )
 
     if st.button("PI設定を検証", key=f"pi_validate_{table_id}", use_container_width=False):
         try:
