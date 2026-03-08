@@ -23,10 +23,7 @@ from .io_utils import load_table as load_file_table
 from .io_utils import prepare_table
 from .models import TableConfig
 from .pi_af_sdk import PIDataError, build_pi_query_config, fetch_pi_datalink_table
-
-FILE_SOURCE_KINDS: set[str] = {"csv", "excel"}
-PI_SOURCE_KINDS: set[str] = {"pi_da_tag", "af_attribute", "af_event_frame"}
-SQL_SOURCE_KIND = "sql"
+from .source_catalog import FILE_SOURCE_KINDS, PI_SOURCE_KINDS, SQL_SOURCE_KIND
 
 
 def is_file_source(source_kind: str) -> bool:
@@ -79,7 +76,7 @@ def build_sql_sample_query_from_options(options: dict[str, Any], table_name: str
         raise UserInputError(str(exc)) from exc
 
 
-def _build_pi_query_kwargs(source_kind: str, options: dict[str, Any]) -> dict[str, Any]:
+def build_pi_query_kwargs_from_source_options(source_kind: str, options: dict[str, Any]) -> dict[str, Any]:
     """Convert source options into PI query configuration kwargs."""
     return {
         "data_source": source_kind,
@@ -130,7 +127,7 @@ def load_table_from_source(
     if source_kind in PI_SOURCE_KINDS:
         options = dict(table.source_options or {})
         try:
-            config = build_pi_query_config(**_build_pi_query_kwargs(source_kind, options))
+            config = build_pi_query_config(**build_pi_query_kwargs_from_source_options(source_kind, options))
             raw = fetch_pi_datalink_table(config)
         except PIDataError as exc:
             raise UserInputError(str(exc)) from exc
@@ -139,4 +136,3 @@ def load_table_from_source(
         return prepare_table(raw, table)
 
     raise UserInputError(f"未対応のデータソース種別です: {source_kind}")
-

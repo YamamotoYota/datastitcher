@@ -6,8 +6,10 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
 from src.join_engine import PandasEquiJoinEngine, execute_join_plan
+from src.errors import UserInputError
 from src.models import UNION_KEEP_AS_NEW, JoinPlan, JoinStep, OutputSettings, TableConfig
 from src.recipe import build_recipe, recipe_from_json, recipe_to_json
 
@@ -232,4 +234,78 @@ def test_union_with_column_mapping_and_new_column() -> None:
     report = result.step_results[0].report
     assert report.operation == "union"
     assert report.details["mapped_columns"] == 3
+
+
+def test_equi_join_with_right_pre_aggregation_weighted_mean() -> None:
+    left = pd.DataFrame({"product_lot": ["A", "B"], "product_quality": [1.2, 1.8]})
+    right = pd.DataFrame(
+        {
+            "product_lot_ref": ["A", "A", "B"],
+            "raw_lot": ["A-1", "A-2", "B-1"],
+            "feed_kg": [100, 200, 50],
+            "raw_quality": [10.0, 40.0, 90.0],
+        }
+    )
+
+    join_plan = JoinPlan(
+        base_table_id="left",
+        steps=[
+            JoinStep(
+                step_id="step_1",
+                right_table_id="right",
+                operation="join",
+                join_algorithm="equi",
+                join_type="left",
+                left_keys=["product_lot"],
+                right_keys=["product_lot_ref"],
+                right_pre_agg_enabled=True,
+                right_pre_agg_group_keys=["product_lot_ref"],
+                right_pre_agg_weight_col="feed_kg",
+                right_pre_agg_rules={
+                    "raw_quality": {"method": "weighted_mean", "formula": ""},
+                },
+                conflict_policy="keep_both",
+            )
+        ],
+    )
+    table_map = {"left": left, "right": right}
+    result = execute_join_plan(join_plan=join_plan, load_table=lambda tid: table_map[tid], engine=PandasEquiJoinEngine())
+    out = result.final_df.sort_values("product_lot").reset_index(drop=True)
+
+    assert out.shape[0] == 2
+    assert out.loc[0, "raw_quality"] == pytest.approx(30.0)  # (10*100 + 40*200) / 300
+    assert out.loc[1, "raw_quality"] == pytest.approx(90.0)
+    details = result.step_results[0].report.details["right_pre_aggregation"]
+    assert details["input_rows"] == 3
+    assert details["output_rows"] == 2
+
+
+def test_equi_join_with_right_pre_aggregation_requires_weight_for_weighted_mean() -> None:
+    left = pd.DataFrame({"k": ["A"]})
+    right = pd.DataFrame({"k2": ["A"], "v": [10.0]})
+    join_plan = JoinPlan(
+        base_table_id="left",
+        steps=[
+            JoinStep(
+                step_id="step_1",
+                right_table_id="right",
+                operation="join",
+                join_algorithm="equi",
+                join_type="left",
+                left_keys=["k"],
+                right_keys=["k2"],
+                right_pre_agg_enabled=True,
+                right_pre_agg_group_keys=["k2"],
+                right_pre_agg_weight_col="",
+                right_pre_agg_rules={"v": {"method": "weighted_mean", "formula": ""}},
+            )
+        ],
+    )
+
+    with pytest.raises(UserInputError):
+        execute_join_plan(
+            join_plan=join_plan,
+            load_table=lambda tid: {"left": left, "right": right}[tid],
+            engine=PandasEquiJoinEngine(),
+        )
 

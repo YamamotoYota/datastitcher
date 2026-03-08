@@ -116,6 +116,10 @@ class JoinStep:
     asof_allow_exact_matches: bool = True
     conflict_policy: ConflictPolicy = "keep_both"
     suffixes: tuple[str, str] = ("_l", "_r")
+    right_pre_agg_enabled: bool = False
+    right_pre_agg_group_keys: list[str] = field(default_factory=list)
+    right_pre_agg_weight_col: str = ""
+    right_pre_agg_rules: dict[str, dict[str, str]] = field(default_factory=dict)
     union_column_mapping: dict[str, str] = field(default_factory=dict)
     union_right_column_suffix: str = "_u"
     union_add_source_column: bool = False
@@ -153,6 +157,19 @@ class JoinStep:
             asof_allow_exact_matches=bool(data.get("asof_allow_exact_matches", True)),
             conflict_policy=str(data.get("conflict_policy", "keep_both")),  # type: ignore[arg-type]
             suffixes=suffixes,
+            right_pre_agg_enabled=bool(data.get("right_pre_agg_enabled", False)),
+            right_pre_agg_group_keys=[str(v) for v in data.get("right_pre_agg_group_keys", [])],
+            right_pre_agg_weight_col=str(data.get("right_pre_agg_weight_col", "")),
+            right_pre_agg_rules={
+                str(col): {
+                    "method": str(spec.get("method", "first")),
+                    "formula": str(spec.get("formula", "")),
+                }
+                for col, spec in dict(data.get("right_pre_agg_rules", {})).items()
+                if isinstance(spec, dict)
+            }
+            if isinstance(data.get("right_pre_agg_rules", {}), dict)
+            else {},
             union_column_mapping={
                 str(k): str(v) for k, v in dict(data.get("union_column_mapping", {})).items()
             }

@@ -42,9 +42,20 @@ from .pi_af_sdk import (
 from .profile import profile_dataframe
 from .recipe import build_recipe, recipe_from_json, recipe_to_json
 from .report import EXCEL_MAX_ROWS, append_execution_log, dataframe_to_csv_bytes, dataframe_to_excel_bytes
-from .source_loader import (
+from .right_aggregation import SUPPORTED_RIGHT_PRE_AGG_METHODS
+from .source_catalog import (
     PI_SOURCE_KINDS,
+    SOURCE_ADD_BUTTON_SPECS,
     SQL_SOURCE_KIND,
+    default_source_file_name,
+    default_source_options,
+    merge_source_options_with_defaults,
+    source_description,
+    source_display_label,
+    source_panel_label,
+)
+from .source_loader import (
+    build_pi_query_kwargs_from_source_options,
     build_sql_sample_query_from_options,
     is_file_source,
     list_sql_tables_from_options,
@@ -68,6 +79,19 @@ UNION_MAPPING_SPECIAL_OPTIONS = [UNION_KEEP_AS_NEW, UNION_DROP]
 SQL_DB_OPTIONS = list(SUPPORTED_DBMS)
 PI_QUERY_TYPE_OPTIONS = list(SUPPORTED_PI_QUERY_TYPES)
 PI_SUMMARY_FUNCTION_OPTIONS = list(SUPPORTED_SUMMARY_FUNCTIONS)
+RIGHT_PRE_AGG_METHOD_OPTIONS = list(SUPPORTED_RIGHT_PRE_AGG_METHODS)
+RIGHT_PRE_AGG_METHOD_LABELS: dict[str, str] = {
+    "first": "先頭値",
+    "last": "末尾値",
+    "sum": "合計",
+    "mean": "平均",
+    "min": "最小",
+    "max": "最大",
+    "count": "件数",
+    "weighted_sum": "重み付き合計",
+    "weighted_mean": "加重平均",
+    "formula": "数式（四則演算）",
+}
 
 
 def _rerun() -> None:
@@ -103,79 +127,11 @@ def _safe_external_table_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:10]}"
 
 
-def _default_source_file_name(source_kind: str) -> str:
-    if source_kind == SQL_SOURCE_KIND:
-        return "sql_source"
-    if source_kind == "pi_da_tag":
-        return "pi_da_tag"
-    if source_kind == "af_attribute":
-        return "af_attribute"
-    if source_kind == "af_event_frame":
-        return "af_event_frame"
-    return source_kind
-
-
-def _default_source_options(source_kind: str) -> dict[str, Any]:
-    """Return source option defaults for each non-file source kind."""
-    if source_kind == SQL_SOURCE_KIND:
-        return {
-            "dbms": "sqlserver",
-            "host": "",
-            "port": "",
-            "database": "",
-            "schema": "",
-            "username": "",
-            "password": "",
-            "sqlite_path": "",
-            "query": "",
-        }
-    if source_kind == "pi_da_tag":
-        return {
-            "pi_server": "",
-            "af_server": "",
-            "af_database": "",
-            "query_type": "recorded",
-            "tags_text": "",
-            "start_time": "*-1d",
-            "end_time": "*",
-            "interval": "1h",
-            "summary_functions": ["average", "min", "max"],
-            "max_rows_per_tag": 10000,
-        }
-    if source_kind == "af_attribute":
-        return {
-            "pi_server": "",
-            "af_server": "",
-            "af_database": "",
-            "query_type": "recorded",
-            "af_element": "",
-            "af_attributes_text": "",
-            "start_time": "*-1d",
-            "end_time": "*",
-            "interval": "1h",
-            "summary_functions": ["average", "min", "max"],
-            "max_rows_per_tag": 10000,
-        }
-    if source_kind == "af_event_frame":
-        return {
-            "af_server": "",
-            "af_database": "",
-            "ef_template": "",
-            "ef_analyses_text": "",
-            "start_time": "*-1d",
-            "end_time": "*",
-            "max_rows_per_tag": 10000,
-        }
-    return {}
-
-
 def _ensure_source_options_defaults(cfg: TableConfig) -> TableConfig:
     """Fill missing source options for external sources."""
     if is_file_source(str(cfg.source_kind)):
         return cfg
-    merged = _default_source_options(str(cfg.source_kind))
-    merged.update(dict(cfg.source_options or {}))
-    cfg.source_options = merged
+    cfg.source_options = merge_source_options_with_defaults(str(cfg.source_kind), dict(cfg.source_options or {}))
     return cfg
 
 
@@ -241,6 +197,10 @@ def _ensure_join_plan_shape() -> None:
         step.setdefault("asof_allow_exact_matches", True)
         step.setdefault("conflict_policy", "keep_both")
         step.setdefault("suffixes", ["_l", "_r"])
+        step.setdefault("right_pre_agg_enabled", False)
+        step.setdefault("right_pre_agg_group_keys", [])
+        step.setdefault("right_pre_agg_weight_col", "")
+        step.setdefault("right_pre_agg_rules", {})
         step.setdefault("union_column_mapping", {})
         step.setdefault("union_right_column_suffix", "_u")
         step.setdefault("union_add_source_column", False)
@@ -256,6 +216,10 @@ def _ensure_join_plan_shape() -> None:
             step["left_by_keys"] = []
         if not isinstance(step["right_by_keys"], list):
             step["right_by_keys"] = []
+        if not isinstance(step["right_pre_agg_group_keys"], list):
+            step["right_pre_agg_group_keys"] = []
+        if not isinstance(step["right_pre_agg_rules"], dict):
+            step["right_pre_agg_rules"] = {}
         if not isinstance(step["union_column_mapping"], dict):
             step["union_column_mapping"] = {}
 
@@ -357,6 +321,10 @@ def _make_new_step(default_right_table_id: str = "") -> dict[str, Any]:
         "asof_allow_exact_matches": True,
         "conflict_policy": "keep_both",
         "suffixes": ["_l", "_r"],
+        "right_pre_agg_enabled": False,
+        "right_pre_agg_group_keys": [],
+        "right_pre_agg_weight_col": "",
+        "right_pre_agg_rules": {},
         "union_column_mapping": {},
         "union_right_column_suffix": "_u",
         "union_add_source_column": False,
@@ -446,22 +414,17 @@ def _sanitize_columns_for_table(cfg: TableConfig, available_columns: list[str]) 
 
 def _add_external_table(source_kind: str) -> None:
     """Add a new SQL/PI table config with source-specific defaults."""
-    labels = {
-        SQL_SOURCE_KIND: "SQLテーブル",
-        "pi_da_tag": "PI DAタグ",
-        "af_attribute": "PI AF属性",
-        "af_event_frame": "PI AFイベントフレーム",
-    }
+    label = source_display_label(source_kind)
     table_id = _safe_external_table_id(source_kind.replace("_", ""))
     cfg = TableConfig(
         table_id=table_id,
-        table_name=f"{labels.get(source_kind, source_kind)}_{len(st.session_state['table_configs']) + 1}",
-        source_file_name=_default_source_file_name(source_kind),
+        table_name=f"{label}_{len(st.session_state['table_configs']) + 1}",
+        source_file_name=default_source_file_name(source_kind),
         source_kind=source_kind,  # type: ignore[arg-type]
-        source_options=_default_source_options(source_kind),
+        source_options=default_source_options(source_kind),
     )
     _update_table_config_in_state(cfg)
-    st.session_state["source_add_message"] = ("success", f"{labels.get(source_kind, source_kind)} を追加しました。")
+    st.session_state["source_add_message"] = ("success", f"{label} を追加しました。")
 
 
 def _render_source_registration_sidebar() -> None:
@@ -473,25 +436,16 @@ def _render_source_registration_sidebar() -> None:
         " 取得種別を変える場合は、目的の種別でテーブルを追加してください。"
     )
 
-    c1, c2 = st.sidebar.columns(2)
-    with c1:
-        if st.button("SQL追加", key="add_sql_source_btn", use_container_width=True):
-            _add_external_table(SQL_SOURCE_KIND)
-            _rerun()
-    with c2:
-        if st.button("PI DA追加", key="add_pi_da_source_btn", use_container_width=True):
-            _add_external_table("pi_da_tag")
-            _rerun()
-
-    c3, c4 = st.sidebar.columns(2)
-    with c3:
-        if st.button("AF属性追加", key="add_af_attr_source_btn", use_container_width=True):
-            _add_external_table("af_attribute")
-            _rerun()
-    with c4:
-        if st.button("AFイベント追加", key="add_af_ef_source_btn", use_container_width=True):
-            _add_external_table("af_event_frame")
-            _rerun()
+    cols = st.sidebar.columns(2)
+    for index, (source_kind, button_label) in enumerate(SOURCE_ADD_BUTTON_SPECS):
+        with cols[index % 2]:
+            if st.button(
+                button_label,
+                key=f"add_external_source_btn_{source_kind}",
+                use_container_width=True,
+            ):
+                _add_external_table(source_kind)
+                _rerun()
 
     msg = st.session_state.get("source_add_message")
     if isinstance(msg, tuple) and len(msg) == 2:
@@ -504,8 +458,7 @@ def _render_source_registration_sidebar() -> None:
 
 def _render_sql_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
     """Render SQL source settings editor."""
-    options = _default_source_options(SQL_SOURCE_KIND)
-    options.update(dict(cfg.source_options or {}))
+    options = merge_source_options_with_defaults(SQL_SOURCE_KIND, dict(cfg.source_options or {}))
 
     dbms_value = normalize_dbms(str(options.get("dbms", "sqlserver")))
     options["dbms"] = st.selectbox(
@@ -613,26 +566,15 @@ def _render_sql_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
 
 def _render_pi_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
     """Render PI AF SDK source settings editor."""
-    mode_labels = {
-        "pi_da_tag": "PI DAサーバーのPIタグデータ",
-        "af_attribute": "PI AFサーバーのAF属性データ",
-        "af_event_frame": "PI AFサーバーのイベントフレームデータ",
-    }
-    mode_descriptions = {
-        "pi_da_tag": "PI Data Archive からタグ値（Snapshot/Recorded/Interpolated/Summary）を取得します。",
-        "af_attribute": "AFデータベース内のエレメント属性値を、PIタグ相当の時系列形式で取得します。",
-        "af_event_frame": "AFイベントフレームをテンプレート・期間・イベント生成分析名で抽出します。",
-    }
     source_kind = str(cfg.source_kind)
-    if source_kind not in mode_labels:
+    if source_kind not in PI_SOURCE_KINDS:
         source_kind = "pi_da_tag"
         cfg.source_kind = source_kind  # type: ignore[assignment]
-        cfg.source_file_name = _default_source_file_name(source_kind)
+        cfg.source_file_name = default_source_file_name(source_kind)
 
-    options = _default_source_options(source_kind)
-    options.update(dict(cfg.source_options or {}))
+    options = merge_source_options_with_defaults(source_kind, dict(cfg.source_options or {}))
 
-    st.info(f"{mode_labels[source_kind]}: {mode_descriptions[source_kind]}")
+    st.info(f"{source_panel_label(source_kind)}: {source_description(source_kind)}")
     st.caption("取得種別はサイドバーで追加したテーブル種別で固定です。")
     st.caption("名前一覧は改行・カンマ・セミコロン・読点（、）区切りで入力できます。")
 
@@ -780,23 +722,7 @@ def _render_pi_source_options(cfg: TableConfig, table_id: str) -> TableConfig:
 
     if st.button("PI設定を検証", key=f"pi_validate_{table_id}", use_container_width=False):
         try:
-            _ = build_pi_query_config(
-                data_source=source_kind,
-                pi_server=options.get("pi_server"),
-                af_server=options.get("af_server"),
-                af_database=options.get("af_database"),
-                query_type=options.get("query_type"),
-                tags_text=options.get("tags_text"),
-                af_element=options.get("af_element"),
-                af_attributes_text=options.get("af_attributes_text"),
-                start_time=options.get("start_time"),
-                end_time=options.get("end_time"),
-                interval=options.get("interval"),
-                summary_functions=options.get("summary_functions"),
-                max_rows_per_tag=options.get("max_rows_per_tag"),
-                ef_template=options.get("ef_template"),
-                ef_analyses_text=options.get("ef_analyses_text"),
-            )
+            _ = build_pi_query_config(**build_pi_query_kwargs_from_source_options(source_kind, options))
             st.success("PI設定は妥当です。")
         except Exception as exc:
             st.error(f"PI設定エラー: {exc}")
@@ -1014,6 +940,106 @@ def _sanitize_step_keys(step: dict[str, Any], left_columns: list[str], right_col
     step["right_by_keys"] = [c for c in step.get("right_by_keys", []) if c in right_columns]
 
 
+def _sanitize_step_right_pre_agg(step: dict[str, Any], right_columns: list[str]) -> None:
+    """Remove stale right pre-aggregation selections after right table changes."""
+    right_column_set = set(right_columns)
+    step["right_pre_agg_group_keys"] = [
+        col for col in step.get("right_pre_agg_group_keys", []) if col in right_column_set
+    ]
+    weight_col = str(step.get("right_pre_agg_weight_col", ""))
+    step["right_pre_agg_weight_col"] = weight_col if weight_col in right_column_set else ""
+
+    raw_rules = step.get("right_pre_agg_rules", {})
+    if not isinstance(raw_rules, dict):
+        raw_rules = {}
+    cleaned_rules: dict[str, dict[str, str]] = {}
+    for col, spec in raw_rules.items():
+        column_name = str(col)
+        if column_name not in right_column_set:
+            continue
+        if column_name in step["right_pre_agg_group_keys"]:
+            continue
+        if not isinstance(spec, dict):
+            continue
+        method = str(spec.get("method", "first"))
+        if method not in RIGHT_PRE_AGG_METHOD_OPTIONS:
+            method = "first"
+        cleaned_rules[column_name] = {
+            "method": method,
+            "formula": str(spec.get("formula", "")),
+        }
+    step["right_pre_agg_rules"] = cleaned_rules
+
+
+def _render_right_pre_agg_editor(step: dict[str, Any], step_id: str, right_columns: list[str]) -> None:
+    """Render right pre-aggregation options for equi join."""
+    step["right_pre_agg_enabled"] = st.checkbox(
+        "右テーブルを事前集約してから結合する（1対多/多対多対応）",
+        value=bool(step.get("right_pre_agg_enabled", False)),
+        key=f"right_pre_agg_enabled_{step_id}",
+    )
+    if not step["right_pre_agg_enabled"]:
+        return
+
+    st.caption("例: 原料ロット品質を仕込み量で加重平均して製品ロットへ結合")
+    default_group_keys = step.get("right_pre_agg_group_keys", []) or step.get("right_keys", [])
+    step["right_pre_agg_group_keys"] = st.multiselect(
+        "事前集約のグループキー（通常は右キーと同じ）",
+        options=right_columns,
+        default=[col for col in default_group_keys if col in right_columns],
+        key=f"right_pre_agg_group_keys_{step_id}",
+    )
+
+    weight_options = [""] + right_columns
+    current_weight = str(step.get("right_pre_agg_weight_col", ""))
+    step["right_pre_agg_weight_col"] = st.selectbox(
+        "重み列（加重平均/重み付き合計/数式で使用）",
+        options=weight_options,
+        index=weight_options.index(current_weight) if current_weight in weight_options else 0,
+        key=f"right_pre_agg_weight_col_{step_id}",
+        format_func=lambda col: "(未使用)" if col == "" else col,
+    )
+
+    candidate_columns = [col for col in right_columns if col not in step["right_pre_agg_group_keys"]]
+    existing_rules = step.get("right_pre_agg_rules", {})
+    if not isinstance(existing_rules, dict):
+        existing_rules = {}
+    selected_columns = st.multiselect(
+        "集約対象列",
+        options=candidate_columns,
+        default=[col for col in existing_rules.keys() if col in candidate_columns],
+        key=f"right_pre_agg_target_cols_{step_id}",
+    )
+
+    updated_rules: dict[str, dict[str, str]] = {}
+    for col in selected_columns:
+        existing_rule = existing_rules.get(col, {})
+        if not isinstance(existing_rule, dict):
+            existing_rule = {}
+        default_method = str(existing_rule.get("method", "weighted_mean" if step["right_pre_agg_weight_col"] else "mean"))
+        if default_method not in RIGHT_PRE_AGG_METHOD_OPTIONS:
+            default_method = "mean"
+        method = st.selectbox(
+            f"{col} の集約方式",
+            options=RIGHT_PRE_AGG_METHOD_OPTIONS,
+            index=RIGHT_PRE_AGG_METHOD_OPTIONS.index(default_method),
+            key=f"right_pre_agg_method_{step_id}_{col}",
+            format_func=lambda m: RIGHT_PRE_AGG_METHOD_LABELS.get(m, m),
+        )
+        formula = ""
+        if method == "formula":
+            formula = st.text_input(
+                f"{col} の数式",
+                value=str(existing_rule.get("formula", "sum_vw / sum_w")),
+                key=f"right_pre_agg_formula_{step_id}_{col}",
+                help="利用可能変数: sum_v, mean_v, min_v, max_v, count_v, sum_w, mean_w, sum_vw",
+            )
+        updated_rules[col] = {"method": method, "formula": formula}
+
+    step["right_pre_agg_rules"] = updated_rules
+    st.caption("数式では + - * / と括弧が使えます。重みを使う場合は重み列を指定してください。")
+
+
 def _seed_union_mapping_suggestions(step: dict[str, Any], left_columns: list[str], right_columns: list[str]) -> None:
     """Populate missing union column mappings using heuristic suggestions."""
     existing = step.get("union_column_mapping", {})
@@ -1218,6 +1244,7 @@ def _render_join_plan_sidebar(
             right_preview = table_previews.get(step["right_table_id"]) if step.get("right_table_id") else None
             right_columns = list(right_preview.columns) if isinstance(right_preview, pd.DataFrame) else []
             _sanitize_step_keys(step, left_columns, right_columns)
+            _sanitize_step_right_pre_agg(step, right_columns)
 
             if step["operation"] == "join":
                 if step.get("join_algorithm", "equi") == "equi":
@@ -1241,6 +1268,7 @@ def _render_join_plan_sidebar(
                         default=step.get("right_keys", []),
                         key=f"right_keys_{step_id}",
                     )
+                    _render_right_pre_agg_editor(step, step_id, right_columns)
                 else:
                     step["join_type"] = "left"
                     st.caption("時系列近傍結合（asof）は左結合のみ対応です。")
@@ -1556,6 +1584,13 @@ def _render_step_report(step_result: Any, step_index: int) -> None:
             st.markdown(
                 f"**設定**: `{step.join_type}` / 左キー={step.left_keys} / 右キー={step.right_keys} / 衝突={step.conflict_policy}"
             )
+            pre_agg = report.details.get("right_pre_aggregation", {}) if isinstance(report.details, dict) else {}
+            if isinstance(pre_agg, dict) and pre_agg.get("enabled"):
+                st.caption(
+                    "右テーブル事前集約: "
+                    f"group={pre_agg.get('group_keys', [])}, weight={pre_agg.get('weight_column', '') or '(未使用)'}, "
+                    f"rows={pre_agg.get('input_rows', 0)}→{pre_agg.get('output_rows', 0)}"
+                )
     else:
         mapping = getattr(step, "union_column_mapping", {}) or {}
         sample_mapping = list(mapping.items())[:10]
@@ -1671,6 +1706,23 @@ def run() -> None:
     st.info("使い方: 1) ファイルをアップロードして設定 2) 手順を作成 3) 処理を実行して結果を保存")
 
     st.sidebar.header("操作メニュー")
+    st.sidebar.subheader("アプリ停止")
+    st.sidebar.caption("ボタンを押すと Streamlit サーバーを終了します。再開時は `streamlit run app.py` を実行してください。")
+    shutdown_confirmed = st.sidebar.checkbox(
+        "停止を確認しました",
+        value=False,
+        key="shutdown_confirm_checkbox",
+    )
+    if st.sidebar.button(
+        "アプリを停止",
+        key="shutdown_app_button",
+        use_container_width=True,
+        disabled=not shutdown_confirmed,
+    ):
+        st.sidebar.warning("アプリを停止しています...")
+        time.sleep(0.15)
+        _shutdown_app_server()
+
     uploaded_files = st.sidebar.file_uploader(
         "ファイルをアップロード (CSV / XLSX / XLS / XLSM 混在可)",
         type=["csv", "xlsx", "xls", "xlsm"],
@@ -1694,23 +1746,6 @@ def run() -> None:
     st.sidebar.caption(
         f"アップロード済み: {len(uploaded_map)} 件 / テーブル定義: {len(st.session_state['table_configs'])} 件"
     )
-
-    st.sidebar.subheader("アプリ停止")
-    st.sidebar.caption("ボタンを押すと Streamlit サーバーを終了します。再開時は `streamlit run app.py` を実行してください。")
-    shutdown_confirmed = st.sidebar.checkbox(
-        "停止を確認しました",
-        value=False,
-        key="shutdown_confirm_checkbox",
-    )
-    if st.sidebar.button(
-        "アプリを停止",
-        key="shutdown_app_button",
-        use_container_width=True,
-        disabled=not shutdown_confirmed,
-    ):
-        st.sidebar.warning("アプリを停止しています...")
-        time.sleep(0.15)
-        _shutdown_app_server()
 
     table_previews, _preview_errors = _render_table_management(uploaded_map)
 

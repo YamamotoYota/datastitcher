@@ -17,6 +17,7 @@ from .models import (
     JoinStep,
     JoinStepResult,
 )
+from .right_aggregation import aggregate_right_table_for_join
 
 _TMP_LEFT_ROW_ID = "__ds_left_row_id__"
 _TMP_RIGHT_ROW_ID = "__ds_right_row_id__"
@@ -63,9 +64,21 @@ def _execute_equi_join_step(
 ) -> JoinStepResult:
     _validate_equi_step_inputs(left_df, right_df, step)
 
+    right_for_join = right_df
+    pre_agg_details: dict[str, object] = {}
+    if step.right_pre_agg_enabled:
+        right_for_join, pre_agg_details = aggregate_right_table_for_join(
+            right_df,
+            step_id=step.step_id,
+            group_keys=step.right_pre_agg_group_keys,
+            fallback_group_keys=step.right_keys,
+            weight_column=step.right_pre_agg_weight_col,
+            rules=step.right_pre_agg_rules,
+        )
+
     merged = pd.merge(
         left_df,
-        right_df,
+        right_for_join,
         how=step.join_type,
         left_on=step.left_keys,
         right_on=step.right_keys,
@@ -76,19 +89,22 @@ def _execute_equi_join_step(
         step_id=step.step_id,
         join_type=step.join_type,
         left_df=left_df,
-        right_df=right_df,
+        right_df=right_for_join,
         merged_with_indicator=merged,
         left_keys=step.left_keys,
         right_keys=step.right_keys,
         row_explosion_warn_ratio=row_explosion_warn_ratio,
     )
-    output_df = _resolve_conflicts(merged, left_df, right_df, step)
+    if pre_agg_details:
+        diagnostics.report.details["right_pre_aggregation"] = pre_agg_details
+    output_df = _resolve_conflicts(merged, left_df, right_for_join, step)
     return JoinStepResult(
         step=step,
         output_df=output_df,
         report=diagnostics.report,
         unmatched_left_df=diagnostics.unmatched_left_df,
         unmatched_right_df=diagnostics.unmatched_right_df,
+        details={"right_pre_aggregation": pre_agg_details} if pre_agg_details else {},
     )
 
 

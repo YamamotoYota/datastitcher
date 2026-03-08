@@ -616,17 +616,42 @@ def _load_af_sdk() -> dict[str, Any]:
         "AFEventFrameSearch": AFEventFrameSearch,
     }
 
+def _collection_get_item_by_name(collection: Any, name: str, *, label: str) -> Any:
+    """Resolve .NET collection item by name with get_Item/indexer/fallback scan."""
+    normalized_name = _normalize_user_text(name)
+    if not normalized_name:
+        raise PIDataError(f"{label}名が空です。")
+
+    getter = getattr(collection, "get_Item", None)
+    if callable(getter):
+        try:
+            return getter(normalized_name)
+        except Exception:
+            pass
+
+    try:
+        return collection[normalized_name]
+    except Exception:
+        pass
+
+    try:
+        for item in collection:
+            if _same_name(getattr(item, "Name", ""), normalized_name):
+                return item
+    except Exception:
+        pass
+
+    raise PIDataError(f"{label}が見つかりません: {normalized_name}")
+
+
 def _resolve_named_server(servers: Any, server_name: str, *, kind_label: str) -> Any:
     """Resolve server by explicit name or default server."""
     normalized_server_name = _normalize_user_text(server_name)
     if normalized_server_name:
         try:
-            return servers[normalized_server_name]
-        except Exception:
-            for server in servers:
-                if _same_name(getattr(server, "Name", ""), normalized_server_name):
-                    return server
-            raise PIDataError(f"{kind_label}サーバーが見つかりません: {normalized_server_name}")
+            return _collection_get_item_by_name(servers, normalized_server_name, label=f"{kind_label}サーバー")
+        except Exception as exc:
+            raise PIDataError(f"{kind_label}サーバーが見つかりません: {normalized_server_name}") from exc
 
     default_server: Any = None
     for attr in ("DefaultPIServer", "DefaultAFServer", "DefaultPISystem", "Default"):
@@ -665,13 +690,9 @@ def _resolve_af_database(af_server: Any, database_name: str) -> Any:
         raise PIDataError("AFサーバーからデータベース一覧を取得できません。")
 
     try:
-        return databases[normalized_database_name]
-    except Exception:
-        for db in databases:
-            if _same_name(getattr(db, "Name", ""), normalized_database_name):
-                return db
-
-    raise PIDataError(f"AFデータベースが見つかりません: {normalized_database_name}")
+        return _collection_get_item_by_name(databases, normalized_database_name, label="AFデータベース")
+    except Exception as exc:
+        raise PIDataError(f"AFデータベースが見つかりません: {normalized_database_name}") from exc
 
 
 def _resolve_af_element(af_database: Any, element_name: str, sdk: dict[str, Any]) -> Any:
@@ -683,10 +704,30 @@ def _resolve_af_element(af_database: Any, element_name: str, sdk: dict[str, Any]
     AFElement = sdk["AFElement"]
     AFElementSearch = sdk["AFElementSearch"]
 
+    # 参照コードと同じく、A\B\C の階層パスは get_Item で順に辿る。
+    candidate_path = normalized_element_name.replace("/", "\\")
+    path_parts = [part for part in candidate_path.split("\\") if _normalize_user_text(part)]
+    if path_parts:
+        database_name = _normalize_user_text(getattr(af_database, "Name", ""))
+        if database_name and _same_name(path_parts[0], database_name):
+            path_parts = path_parts[1:]
+
+    elements = getattr(af_database, "Elements", None)
+    if elements is not None and path_parts:
+        try:
+            element = _collection_get_item_by_name(elements, path_parts[0], label="AFルートエレメント")
+            for child_name in path_parts[1:]:
+                child_elements = getattr(element, "Elements", None)
+                if child_elements is None:
+                    raise PIDataError(f"AF子エレメントを取得できません: {child_name}")
+                element = _collection_get_item_by_name(child_elements, child_name, label="AF子エレメント")
+            return element
+        except Exception:
+            pass
+
     candidate_names: list[str] = [normalized_element_name]
-    alt_name = normalized_element_name.replace("/", "\\")
-    if alt_name not in candidate_names:
-        candidate_names.append(alt_name)
+    if candidate_path not in candidate_names:
+        candidate_names.append(candidate_path)
 
     for candidate in candidate_names:
         try:
@@ -694,16 +735,12 @@ def _resolve_af_element(af_database: Any, element_name: str, sdk: dict[str, Any]
         except Exception:
             pass
 
-    elements = getattr(af_database, "Elements", None)
     if elements is not None:
         for candidate in candidate_names:
             try:
-                return elements[candidate]
+                return _collection_get_item_by_name(elements, candidate, label="AFエレメント")
             except Exception:
                 pass
-        for elem in elements:
-            if _same_name(getattr(elem, "Name", ""), normalized_element_name):
-                return elem
 
     try:
         escaped = normalized_element_name.replace("'", "''")
@@ -724,13 +761,9 @@ def _resolve_af_attribute(element: Any, attribute_name: str) -> Any:
         raise PIDataError("AFエレメントに属性コレクションがありません。")
 
     try:
-        return attributes[normalized_attribute_name]
-    except Exception:
-        for attr in attributes:
-            if _same_name(getattr(attr, "Name", ""), normalized_attribute_name):
-                return attr
-
-    raise PIDataError(f"AF属性が見つかりません: {normalized_attribute_name}")
+        return _collection_get_item_by_name(attributes, normalized_attribute_name, label="AF属性")
+    except Exception as exc:
+        raise PIDataError(f"AF属性が見つかりません: {normalized_attribute_name}") from exc
 
 
 def _af_time_to_timestamp(value: Any) -> pd.Timestamp:
