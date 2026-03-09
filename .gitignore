@@ -22,6 +22,10 @@ build/
 dist/
 *.egg-info/
 pip-wheel-metadata/
+!dist/
+dist/*
+!dist/DataStitcher/
+!dist/DataStitcher/**
 
 # IDE/editor
 .vscode/
@@ -37,4 +41,3 @@ logs/*.jsonl
 
 # Streamlit local secrets/config overrides
 .streamlit/secrets.toml
-
