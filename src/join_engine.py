@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Yamamoto Yota
+
 """Join engine abstraction and pandas implementation for join/union steps."""
 
 from __future__ import annotations

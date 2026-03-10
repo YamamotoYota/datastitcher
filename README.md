@@ -1,105 +1,136 @@
 # DataStitcher
 
-DataStitcher は、複数のデータソースをローカルで読み込み、結合と縦連結に特化して統合する Windows 向けのローカル Web アプリです。  
-Streamlit で動作し、CSV / Excel / SQL / PI データを 1 つのテーブルにまとめて、CSV または Excel（1 シート）として出力できます。
+DataStitcher は、複数のデータソースをローカルで読み込み、横方向の結合と縦方向の連結に特化して統合する Windows 向けローカル Web アプリです。  
+CSV / Excel / SQL / PI データを 1 つのテーブルにまとめ、CSV または Excel（1 シート）で出力できます。
 
-## 主な用途
+## 想定実行環境
 
-- 複数の CSV / Excel をキーで結合したい
-- SQL テーブルと Excel ファイルを横持ちで統合したい
-- PI DA タグや PI AF 属性を取得して他テーブルと結合したい
-- 列名が少し違う表同士を union したい
-- 1 対多 / 多対多の関係を、重み付き集約してから結合したい
+このリポジトリは、以下の環境を前提にしています。
 
-## 現在できること
+- OS: Windows
+- Python: Miniforge で作成した `datastitcher` 環境
+- Python バージョン: 3.11 以上
+- パッケージ導入方法:
+  - Python は `conda` で導入
+  - アプリ依存ライブラリは `pip install -r requirements.txt`
 
-- 入力ソース
-  - CSV（UTF-8 / Shift-JIS 系を含む自動判定 + 手動指定）
-  - Excel（`.xlsx`, `.xls`, `.xlsm`）
-  - SQL Server / MySQL / SQLite / Oracle / PostgreSQL
-  - PI DA タグ
-  - PI AF 属性
-  - PI AF イベントフレーム
-- 結合方式
-  - equi join: `inner`, `left`, `right`, `outer`
-  - asof join: `backward`, `forward`, `nearest`
-  - union
-- 補助機能
-  - 複合キー
-  - 列名正規化
-  - 型推定 / 型上書き
-  - 同名列衝突ルール
-  - 未マッチ抽出
-  - レシピ JSON 保存 / 読み込み
-  - 実行ログ保存
-- 1 対多 / 多対多向けの右テーブル事前集約
-  - `first`, `last`, `sum`, `mean`, `min`, `max`, `count`
-  - `weighted_sum`, `weighted_mean`
-  - 数式（四則演算）による集約
-
-## 動作環境
-
-- Windows
-- Python 3.11 以上
-- ローカル実行前提
-
-追加で必要なもの:
-- SQL を使う場合: 各 DB の接続ドライバ
-- PI を使う場合: PI AF Client / AF SDK 実行環境
+SQL や PI を使う場合は、別途ドライバや PI AF Client / AF SDK が必要です。
 
 ## セットアップ
 
-```bash
+### 1. Miniforge 環境を作成
+
+```powershell
+conda create -n datastitcher python=3.11
+conda activate datastitcher
+```
+
+### 2. 依存ライブラリを導入
+
+```powershell
 pip install -r requirements.txt
+```
+
+## アプリの起動
+
+```powershell
+conda activate datastitcher
 streamlit run app.py
 ```
 
-起動後:
-- ブラウザで `http://localhost:8501` を開く
+起動後はブラウザで `http://localhost:8501` を開きます。
 
-## 実行ファイルの起動
+## 実行ファイルの作成
 
-PyInstaller で作成した実行ファイルは `dist\DataStitcher\DataStitcher.exe` です。
+### 標準手順
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
+```
+
+`build_exe.ps1` は次のどちらでも動くようにしてあります。
+
+- `conda activate datastitcher` 済みの PowerShell から実行
+- `conda` コマンドが利用できる状態で、未アクティブのまま実行
+
+また、現在のカレントディレクトリに依存せず、スクリプト配置フォルダを基準にビルドします。
+
+このスクリプトは以下を行います。
+
+1. 実行中の PowerShell から `datastitcher` 環境を特定
+2. 必要ならその環境に `pyinstaller` を導入・更新
+3. `DataStitcher.spec` を使ってビルド
+
+### 直接 PyInstaller を使う場合
+
+```powershell
+conda activate datastitcher
+python -m PyInstaller --noconfirm --clean .\DataStitcher.spec
+```
+
+### 生成物
+
+- 実行ファイル: `dist\DataStitcher\DataStitcher.exe`
+- 配布に必要な一式: `dist\DataStitcher\`
 
 注意:
-- `DataStitcher.exe` 単体ではなく、`dist\DataStitcher` フォルダ一式が必要です
-- 起動すると内部で Streamlit サーバーを立ち上げます
-- 初回起動時はローカルポート利用や Windows Defender の確認が入る場合があります
 
-## 使い方
+- `DataStitcher.exe` 単体ではなく、`dist\DataStitcher` フォルダごと配布してください
+- 実行ファイル起動時は内部で Streamlit サーバーを立ち上げます
+- 初回起動時は Windows Defender の確認が表示される場合があります
 
-1. サイドバー上部で必要ならアプリ停止機能を利用
-2. 入力テーブルを追加
-   - ファイルはアップロード
-   - SQL / PI は「外部データソース追加」から追加
-3. 各テーブルで読み込み設定を調整
-   - 列名正規化
-   - 使用列選択
-   - 型上書き
-   - CSV / Excel / SQL / PI の個別設定
-4. 結合手順を追加
-5. 各手順で `join` または `union` を設定
-6. 必要に応じて asof や右テーブル事前集約を設定
-7. 実行して結果を確認し、CSV / Excel をダウンロード
+## 主な機能
 
-## 右テーブル事前集約付き join
+### 入力ソース
 
-製品ロットと原料ロットのように、左 1 件に対して右が複数件ぶら下がるケース向けの機能です。  
-通常の join の前に右テーブルをグループ単位で集約し、その集約結果を左テーブルに結合します。
+- CSV
+- Excel（`.xlsx`, `.xls`, `.xlsm`）
+- SQL Server / MySQL / SQLite / Oracle / PostgreSQL
+- PI DA タグ
+- PI AF 属性
+- PI AF イベントフレーム
 
-例:
-- 左テーブル: 製品ロット `A`
-- 右テーブル: 原料ロット `A-1`, `A-2`
-- 重み列: `仕込み量`
-- 集約対象列: `品質値`
-- 集約方式: `weighted_mean`
+### データ統合
 
-この場合、`品質値` は `仕込み量` を重みとした加重平均に変換されてから製品ロット `A` に結合されます。
+- `join`
+  - `inner`
+  - `left`
+  - `right`
+  - `outer`
+- `asof join`
+  - `backward`
+  - `forward`
+  - `nearest`
+- `union`
 
-### 数式集約
+### 補助機能
 
-集約方式に `formula` を選ぶと、列ごとに数式を指定できます。  
-使用可能な変数:
+- 複合キー
+- 列名正規化
+- 型推定 / 型上書き
+- 同名列衝突ルール
+- 未マッチ抽出
+- レシピ JSON 保存 / 読み込み
+- 実行ログ保存
+
+### 1対多 / 多対多向けの右テーブル事前集約
+
+右テーブルを集約してから結合できます。製品ロットと原料ロットのようなデータで、原料の仕込み量を重みにした加重平均を計算してから製品ロットに結合する用途を想定しています。
+
+利用できる集約方式:
+
+- `first`
+- `last`
+- `sum`
+- `mean`
+- `min`
+- `max`
+- `count`
+- `weighted_sum`
+- `weighted_mean`
+- `formula`
+
+`formula` では次の変数を利用できます。
 
 - `sum_v`
 - `mean_v`
@@ -110,18 +141,24 @@ PyInstaller で作成した実行ファイルは `dist\DataStitcher\DataStitcher
 - `mean_w`
 - `sum_vw`
 
-使用可能な演算:
-- `+`
-- `-`
-- `*`
-- `/`
-- 括弧
-
 例:
 
 ```text
 sum_vw / sum_w
 ```
+
+## 基本的な使い方
+
+1. サイドバー最上部のアプリ停止ボタンの位置を確認
+2. 入力テーブルを追加
+3. 各テーブルで列名正規化、使用列、型を調整
+4. 結合手順を追加
+5. 手順ごとに `join` / `asof join` / `union` を設定
+6. 必要に応じて右テーブル事前集約を設定
+7. 実行して品質指標を確認
+8. 最終結果を CSV または Excel で保存
+
+`data\README.md` にテスト用データの確認手順を記載しています。
 
 ## 品質指標
 
@@ -136,68 +173,62 @@ sum_vw / sum_w
 
 ## レシピとログ
 
-- レシピ
-  - 現在の設定を JSON で保存
-  - 後で再読み込みして同じ処理を再実行
-- 実行ログ
-  - `logs/execution_log.jsonl`
-  - 入力情報、ステップ指標、最終行列数を記録
+### レシピ
+
+- 現在の設定を JSON で保存
+- 後で再読み込みして同じ処理を再実行
+
+### 実行ログ
+
+- 保存先: `logs\execution_log.jsonl`
+- 記録内容:
+  - 入力情報
+  - ステップごとの品質指標
+  - 最終行数 / 列数
 
 ## テスト
 
-```bash
+```powershell
+conda activate datastitcher
 pytest -q
 ```
 
 現在のテスト対象:
-- equi join
+
+- 通常 join
 - asof join
 - union
 - 右テーブル事前集約
-- SQL ソースロード
+- SQL ソース読み込み
 - PI 設定正規化
-- ソース種別定義
-
-## 実行ファイルの作成
-
-使用環境:
-- `C:\Users\yamam\miniforge3\envs\datastitcher\python.exe`
-
-ビルド:
-
-```powershell
-.\build_exe.ps1
-```
-
-生成物:
-- `dist\DataStitcher\DataStitcher.exe`
-- `dist\DataStitcher\_internal\...`
+- PyInstaller 用ビルド補助
 
 ## ディレクトリ構成
 
 ```text
 app.py
 build_exe.ps1
-launcher_datastitcher.py
 DataStitcher.spec
+launcher_datastitcher.py
 src/
-  streamlit_app.py
-  source_catalog.py
-  source_loader.py
+  build_support.py
+  column_match.py
   db_connectors.py
-  pi_af_sdk.py
-  right_aggregation.py
-  join_engine.py
-  join_report.py
-  join_plan.py
+  errors.py
   io_utils.py
+  join_engine.py
+  join_plan.py
+  join_report.py
   models.py
+  normalization.py
+  pi_af_sdk.py
+  profile.py
   recipe.py
   report.py
-  column_match.py
-  normalization.py
-  profile.py
-  errors.py
+  right_aggregation.py
+  source_catalog.py
+  source_loader.py
+  streamlit_app.py
 tests/
 data/
 dist/
@@ -208,22 +239,44 @@ logs/
 
 - `asof join` は `left join` のみ対応
 - union の列対応推定はヒューリスティック
-- pandas ベースのため、大規模データではメモリ制約あり
-- PI AF SDK は実行環境依存
-- fuzzy join / range join / cross join は未実装
+- pandas ベースのため、大規模データではメモリ制約があります
+- PI AF SDK は実行環境依存です
+- fuzzy join / range join / cross join は未実装です
 
 ## トラブルシュート
 
-- CSV の文字化け
-  - 文字コードを `utf-8-sig` / `cp932` などに切り替えて確認
-- Excel の列名がずれる
-  - ヘッダ行番号を確認
-- SQL 接続できない
-  - ドライバ、接続先、認証情報、ポートを確認
-- PI 取得に失敗する
-  - AF SDK、`pythonnet`、サーバー名、DB 名、エレメント名、属性名を確認
-- 実行ファイルが起動しない
-  - `dist\DataStitcher` フォルダ一式が揃っているか確認
+### 文字化けする
+
+- CSV の文字コードを `utf-8-sig` や `cp932` に切り替えて再確認してください
+
+### Excel の列名がずれる
+
+- ヘッダ行番号を確認してください
+
+### SQL に接続できない
+
+- ドライバ
+- 接続先ホスト
+- ポート
+- 認証情報
+
+を確認してください。
+
+### PI データを取得できない
+
+- PI AF Client / AF SDK
+- `pythonnet`
+- サーバー名
+- データベース名
+- エレメント名
+- 属性名
+
+を確認してください。
+
+### 実行ファイルを起動できない
+
+- `dist\DataStitcher` フォルダ一式が揃っているか確認してください
+- `DataStitcher.exe` を単体で移動していないか確認してください
 
 ## ライセンス
 
