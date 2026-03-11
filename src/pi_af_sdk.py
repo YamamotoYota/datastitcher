@@ -679,6 +679,74 @@ def _connect_server(server: Any, *, label: str) -> None:
         raise PIDataError(f"{label}への接続に失敗しました: {exc}") from exc
 
 
+def _invoke_sdk_method(target: Any, method_name: str, arg_sets: list[tuple[Any, ...]], *, label: str) -> Any:
+    """Call AF SDK method with multiple signature fallbacks."""
+    method = getattr(target, method_name, None)
+    if not callable(method):
+        raise PIDataError(f"{label}を呼び出せません: {method_name}")
+
+    last_exc: Exception | None = None
+    for args in arg_sets:
+        try:
+            return method(*args)
+        except Exception as exc:
+            last_exc = exc
+
+    detail = f"{type(last_exc).__name__}: {last_exc}" if last_exc is not None else "候補シグネチャなし"
+    raise PIDataError(f"{label}の呼び出しに失敗しました: {detail}")
+
+
+def _create_search_object(search_cls: Any, arg_sets: list[tuple[Any, ...]], *, label: str) -> Any:
+    """Construct AF SDK search object with signature fallbacks."""
+    last_exc: Exception | None = None
+    for args in arg_sets:
+        try:
+            return search_cls(*args)
+        except Exception as exc:
+            last_exc = exc
+
+    detail = f"{type(last_exc).__name__}: {last_exc}" if last_exc is not None else "候補コンストラクタなし"
+    raise PIDataError(f"{label}の初期化に失敗しました: {detail}")
+
+
+def _call_recorded_values(target: Any, time_range: Any, boundary_type: Any, max_rows: int, *, label: str) -> Any:
+    """Call RecordedValues with cross-version overload fallbacks."""
+    return _invoke_sdk_method(
+        target,
+        "RecordedValues",
+        [
+            (time_range, boundary_type, "", False, int(max_rows)),
+            (time_range, boundary_type, None, False, int(max_rows)),
+            (time_range, boundary_type, "", False),
+            (time_range, boundary_type, None, False),
+        ],
+        label=label,
+    )
+
+
+def _call_interpolated_values(target: Any, time_range: Any, interval: Any, *, label: str) -> Any:
+    """Call InterpolatedValues with cross-version overload fallbacks."""
+    return _invoke_sdk_method(
+        target,
+        "InterpolatedValues",
+        [
+            (time_range, interval, "", False),
+            (time_range, interval, None, False),
+            (time_range, interval, None, None, False),
+            (time_range, interval, "", None, False),
+        ],
+        label=label,
+    )
+
+
+def _get_attribute_data(attribute: Any, tag_name: str) -> Any:
+    """Return AF attribute data accessor."""
+    data = getattr(attribute, "Data", None)
+    if data is None:
+        raise PIDataError(f"属性データ参照に失敗しました: {tag_name}")
+    return data
+
+
 def _resolve_af_database(af_server: Any, database_name: str) -> Any:
     """Resolve AF database from AF server."""
     normalized_database_name = _normalize_user_text(database_name)
@@ -744,7 +812,15 @@ def _resolve_af_element(af_database: Any, element_name: str, sdk: dict[str, Any]
 
     try:
         escaped = normalized_element_name.replace("'", "''")
-        search = AFElementSearch(af_database, "insighta_element_search", f"Name:'{escaped}'")
+        search = _create_search_object(
+            AFElementSearch,
+            [
+                (af_database, "insighta_element_search", f"Name:'{escaped}'"),
+                (af_database, f"Name:'{escaped}'"),
+                (af_database, None, f"Name:'{escaped}'"),
+            ],
+            label="AFエレメント検索",
+        )
         for elem in search.FindObjects(1):
             return elem
     except Exception:
@@ -806,6 +882,8 @@ def _af_value_to_python(value: Any) -> Any:
     if value is None:
         return None
     candidate = getattr(value, "Value", value)
+    if isinstance(candidate, (bool, int, float, str)):
+        return candidate
     for caster in (int, float):
         try:
             return caster(candidate)
@@ -837,12 +915,12 @@ def _collect_recorded(point: Any, tag: str, sdk: dict[str, Any], config: PIQuery
     AFTimeRange = sdk["AFTimeRange"]
     AFBoundaryType = sdk["AFBoundaryType"]
     time_range = AFTimeRange(AFTime(config.start_time), AFTime(config.end_time))
-    values = point.RecordedValues(
+    values = _call_recorded_values(
+        point,
         time_range,
         AFBoundaryType.Inside,
-        "",
-        False,
         int(config.max_rows_per_tag),
+        label=f"PIタグ RecordedValues({tag})",
     )
 
     rows: list[dict[str, Any]] = []
@@ -870,7 +948,7 @@ def _collect_interpolated(point: Any, tag: str, sdk: dict[str, Any], config: PIQ
     except Exception as exc:
         raise PIDataError(f"集計間隔の書式が不正です: {config.interval}") from exc
 
-    values = point.InterpolatedValues(time_range, interval, "", False)
+    values = _call_interpolated_values(point, time_range, interval, label=f"PIタグ InterpolatedValues({tag})")
     rows: list[dict[str, Any]] = []
     for idx, af_value in enumerate(values):
         if idx >= int(config.max_rows_per_tag):
@@ -943,7 +1021,21 @@ def _summarize_rows(rows: list[dict[str, Any]], config: PIQueryConfig) -> list[d
 
 def _collect_attribute_snapshot(attribute: Any, tag_name: str) -> list[dict[str, Any]]:
     """Collect snapshot-like row for AF attribute."""
-    af_value = attribute.GetValue()
+    value_attempts = [
+        lambda: attribute.GetValue(),
+        lambda: _invoke_sdk_method(_get_attribute_data(attribute, tag_name), "Snapshot", [tuple()], label=f"AF属性 Snapshot({tag_name})"),
+        lambda: _invoke_sdk_method(_get_attribute_data(attribute, tag_name), "CurrentValue", [tuple()], label=f"AF属性 CurrentValue({tag_name})"),
+    ]
+    last_exc: Exception | None = None
+    af_value: Any = None
+    for attempt in value_attempts:
+        try:
+            af_value = attempt()
+            break
+        except Exception as exc:
+            last_exc = exc
+    if af_value is None and last_exc is not None:
+        raise PIDataError(f"AF属性スナップショット取得に失敗しました: {tag_name}. {last_exc}") from last_exc
     return [
         {
             "tag": tag_name,
@@ -967,16 +1059,13 @@ def _collect_attribute_recorded(
     AFBoundaryType = sdk["AFBoundaryType"]
     time_range = AFTimeRange(AFTime(config.start_time), AFTime(config.end_time))
 
-    data = getattr(attribute, "Data", None)
-    if data is None:
-        raise PIDataError(f"属性データ参照に失敗しました: {tag_name}")
-
-    values = data.RecordedValues(
+    data = _get_attribute_data(attribute, tag_name)
+    values = _call_recorded_values(
+        data,
         time_range,
         AFBoundaryType.Inside,
-        "",
-        False,
         int(config.max_rows_per_tag),
+        label=f"AF属性 RecordedValues({tag_name})",
     )
     rows: list[dict[str, Any]] = []
     for af_value in values:
@@ -1008,11 +1097,13 @@ def _collect_attribute_interpolated(
     except Exception as exc:
         raise PIDataError(f"集計間隔の書式が不正です: {config.interval}") from exc
 
-    data = getattr(attribute, "Data", None)
-    if data is None:
-        raise PIDataError(f"属性データ参照に失敗しました: {tag_name}")
-
-    values = data.InterpolatedValues(time_range, interval, "", False)
+    data = _get_attribute_data(attribute, tag_name)
+    values = _call_interpolated_values(
+        data,
+        time_range,
+        interval,
+        label=f"AF属性 InterpolatedValues({tag_name})",
+    )
     rows: list[dict[str, Any]] = []
     for idx, af_value in enumerate(values):
         if idx >= int(config.max_rows_per_tag):
@@ -1130,9 +1221,11 @@ def _extract_event_frame_analysis_names(event_frame: Any) -> tuple[str, ...]:
     """Extract possible analysis names from event frame metadata."""
     names: list[str] = []
 
-    source_analysis = getattr(event_frame, "SourceAnalysis", None)
-    if source_analysis is not None:
-        name = _normalize_user_text(getattr(source_analysis, "Name", ""))
+    for analysis_attr in ("SourceAnalysis", "Analysis", "GeneratingAnalysis"):
+        source_analysis = getattr(event_frame, analysis_attr, None)
+        if source_analysis is None:
+            continue
+        name = _normalize_user_text(getattr(source_analysis, "Name", "") or source_analysis)
         if name:
             names.append(name)
 
@@ -1166,6 +1259,50 @@ def _match_any_analysis(required: tuple[str, ...], available: tuple[str, ...]) -
     return any(req in avail or avail in req for req in required_norm for avail in available_norm)
 
 
+def _extract_event_frame_template_name(event_frame: Any) -> str:
+    """Extract event frame template name across SDK variants."""
+    template = getattr(event_frame, "Template", None)
+    candidates = [
+        getattr(template, "Name", "") if template is not None else "",
+        getattr(event_frame, "TemplateName", ""),
+        getattr(event_frame, "Template", "") if isinstance(getattr(event_frame, "Template", None), str) else "",
+    ]
+    for candidate in candidates:
+        text = _normalize_user_text(candidate)
+        if text:
+            return text
+    return ""
+
+
+def _extract_event_frame_element_name(event_frame: Any) -> str:
+    """Extract representative referenced element name across SDK variants."""
+    direct_candidates = [
+        getattr(event_frame, "PrimaryReferencedElement", None),
+        getattr(event_frame, "PrimaryElement", None),
+    ]
+    for candidate in direct_candidates:
+        name = _normalize_user_text(getattr(candidate, "Name", "") or "")
+        if name:
+            return name
+
+    collection_candidates = [
+        getattr(event_frame, "PrimaryReferencedElements", None),
+        getattr(event_frame, "ReferencedElements", None),
+        getattr(event_frame, "Elements", None),
+    ]
+    for collection in collection_candidates:
+        if collection is None:
+            continue
+        try:
+            for item in collection:
+                name = _normalize_user_text(getattr(item, "Name", "") or "")
+                if name:
+                    return name
+        except Exception:
+            continue
+    return ""
+
+
 def _fetch_af_event_frame_rows(config: PIQueryConfig, sdk: dict[str, Any]) -> list[dict[str, Any]]:
     """Fetch AF event frame rows filtered by template, time range, and analysis names."""
     af_server_collection_factory = sdk["AFServerCollectionFactory"]
@@ -1177,7 +1314,15 @@ def _fetch_af_event_frame_rows(config: PIQueryConfig, sdk: dict[str, Any]) -> li
 
     escaped_template = _normalize_user_text(config.ef_template).replace("'", "''")
     search_query = f"Template:'{escaped_template}'"
-    search = AFEventFrameSearch(af_database, "insighta_ef_search", search_query)
+    search = _create_search_object(
+        AFEventFrameSearch,
+        [
+            (af_database, "insighta_ef_search", search_query),
+            (af_database, search_query),
+            (af_database, None, search_query),
+        ],
+        label="イベントフレーム検索",
+    )
     candidates = _list_search_results(search, int(config.max_rows_per_tag))
 
     start_bound = _af_time_text_to_timestamp(sdk, config.start_time)
@@ -1186,8 +1331,7 @@ def _fetch_af_event_frame_rows(config: PIQueryConfig, sdk: dict[str, Any]) -> li
 
     rows: list[dict[str, Any]] = []
     for event_frame in candidates:
-        template = getattr(event_frame, "Template", None)
-        template_name = _normalize_user_text(getattr(template, "Name", "") or "")
+        template_name = _extract_event_frame_template_name(event_frame)
         if template_name and not _same_name(template_name, config.ef_template):
             continue
 
@@ -1202,8 +1346,7 @@ def _fetch_af_event_frame_rows(config: PIQueryConfig, sdk: dict[str, Any]) -> li
         if not _match_any_analysis(analysis_filters, analysis_names):
             continue
 
-        primary_element = getattr(event_frame, "PrimaryReferencedElement", None)
-        element_name = _normalize_user_text(getattr(primary_element, "Name", "") or "")
+        element_name = _extract_event_frame_element_name(event_frame)
         duration_sec: float | None = None
         if pd.notna(start_ts) and pd.notna(end_ts):
             duration_sec = float((end_ts - start_ts).total_seconds())
