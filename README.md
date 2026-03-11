@@ -60,6 +60,7 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 1. 実行中の PowerShell から `datastitcher` 環境を特定
 2. 必要ならその環境に `pyinstaller` を導入・更新
 3. `DataStitcher.spec` を使ってビルド
+4. GitHub にそのまま push できる `dist\DataStitcher` 配下の実行ファイル一式を更新
 
 ### 直接 PyInstaller を使う場合
 
@@ -77,6 +78,8 @@ python -m PyInstaller --noconfirm --clean .\DataStitcher.spec
 
 - `DataStitcher.exe` 単体ではなく、`dist\DataStitcher` フォルダごと配布してください
 - 実行ファイル起動時は内部で Streamlit サーバーを立ち上げます
+- 実行ファイル起動時は既定ブラウザを自動で開きます
+- 既定ポート `8501` が使用中の場合は、空いている次のポートへ自動で切り替えます
 - 初回起動時は Windows Defender の確認が表示される場合があります
 
 ## 主な機能
@@ -277,7 +280,8 @@ logs/
 
 - `dist\DataStitcher` フォルダ一式が揃っているか確認してください
 - `DataStitcher.exe` を単体で移動していないか確認してください
-- アクセス先は `http://localhost:8501` です。`http://localhost:3000` が表示される場合は古い実行ファイルです。最新版で `build_exe.ps1` を実行して `dist\DataStitcher` を作り直してください
+- アクセス先は通常 `http://localhost:8501` です。`8501` が使用中なら `8502`, `8503` のように自動で空きポートへ切り替わります
+- `http://localhost:3000` が表示される場合は古い実行ファイルです。最新版で `build_exe.ps1` を実行して `dist\DataStitcher` を作り直してください
 - 実行ログに `Serving static content from the Node dev server` と出る場合も同様に古い実行ファイルです
 
 ## ライセンス
