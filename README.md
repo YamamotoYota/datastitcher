@@ -277,6 +277,8 @@ logs/
 
 - `dist\DataStitcher` フォルダ一式が揃っているか確認してください
 - `DataStitcher.exe` を単体で移動していないか確認してください
+- アクセス先は `http://localhost:8501` です。`http://localhost:3000` が表示される場合は古い実行ファイルです。最新版で `build_exe.ps1` を実行して `dist\DataStitcher` を作り直してください
+- 実行ログに `Serving static content from the Node dev server` と出る場合も同様に古い実行ファイルです
 
 ## ライセンス
 
