@@ -31,20 +31,72 @@ def resolve_env_prefix(python_executable: str | Path | None = None) -> Path:
     executable = Path(python_executable or sys.executable).resolve()
     if executable.is_dir():
         return executable
-    if executable.parent.name.lower() == "scripts":
+    if executable.parent.name.lower() in {"scripts", "bin"}:
         return executable.parent.parent
     return executable.parent
 
 
+def _dedupe_paths(paths: Iterable[Path]) -> tuple[Path, ...]:
+    """Return stable path list without duplicates."""
+    unique_paths: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = str(path).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_paths.append(path)
+    return tuple(unique_paths)
+
+
+def _read_pyvenv_home(prefix: Path) -> Path | None:
+    """Return the base interpreter home from pyvenv.cfg when present."""
+    config_path = prefix / "pyvenv.cfg"
+    if not config_path.exists():
+        return None
+
+    try:
+        for line in config_path.read_text(encoding="utf-8").splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip().lower() == "home":
+                home = Path(value.strip()).expanduser()
+                return home.resolve() if home.exists() else home
+    except Exception:
+        return None
+    return None
+
+
+def iter_env_prefixes(env_prefix: str | Path | None = None) -> tuple[Path, ...]:
+    """Return runtime-relevant environment/base prefixes without duplicates."""
+    if env_prefix is None:
+        prefixes = [
+            Path(sys.prefix).resolve(),
+            Path(sys.exec_prefix).resolve(),
+            Path(getattr(sys, "base_prefix", sys.prefix)).resolve(),
+            Path(getattr(sys, "base_exec_prefix", getattr(sys, "base_prefix", sys.exec_prefix))).resolve(),
+        ]
+        return _dedupe_paths(prefixes)
+
+    resolved_prefix = resolve_env_prefix(env_prefix)
+    prefixes = [resolved_prefix]
+    base_home = _read_pyvenv_home(resolved_prefix)
+    if base_home is not None:
+        prefixes.append(base_home)
+    return _dedupe_paths(prefixes)
+
+
 def iter_runtime_search_dirs(env_prefix: str | Path | None = None) -> tuple[Path, ...]:
     """Return candidate directories that may contain runtime DLLs."""
-    prefix = resolve_env_prefix(env_prefix)
-    directories = (
-        prefix / "Library" / "bin",
-        prefix / "DLLs",
-        prefix,
-        prefix / "bin",
-    )
+    directories: list[Path] = []
+    for prefix in iter_env_prefixes(env_prefix):
+        directories.extend(
+            [
+                prefix / "Library" / "bin",
+                prefix / "DLLs",
+                prefix,
+                prefix / "bin",
+            ]
+        )
     unique_directories: list[Path] = []
     for directory in directories:
         if directory not in unique_directories:

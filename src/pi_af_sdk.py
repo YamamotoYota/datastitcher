@@ -21,10 +21,14 @@ from typing import Any
 
 import pandas as pd
 
+from .runtime_config import FORCED_PYTHONNET_RUNTIME, apply_pythonnet_runtime_env
+
 SUPPORTED_PI_DATA_SOURCES: tuple[str, ...] = ("pi_da_tag", "af_attribute", "af_event_frame")
 SUPPORTED_PI_QUERY_TYPES: tuple[str, ...] = ("snapshot", "recorded", "interpolated", "summary")
 SUPPORTED_SUMMARY_FUNCTIONS: tuple[str, ...] = ("average", "min", "max", "sum", "count", "std")
 
+# Force pythonnet runtime selection at import time so shell/system env does not affect behavior.
+apply_pythonnet_runtime_env()
 _NAME_SPLIT_PATTERN = re.compile(r"[\n\r\t,;、，；]+")
 
 
@@ -301,8 +305,7 @@ def _infer_pipc_root_from_dll(dll_path: Path) -> Path | None:
 
 def _prepare_afsdk_environment() -> None:
     """Prepare process-level env vars for robust AF SDK loading."""
-    if not os.environ.get("PYTHONNET_RUNTIME"):
-        os.environ["PYTHONNET_RUNTIME"] = "netfx"
+    apply_pythonnet_runtime_env()
 
     candidates = _afsdk_dll_candidates()
     parent_dirs = [str(path.parent) for path in candidates if path.parent]
@@ -326,6 +329,63 @@ def _prepare_afsdk_environment() -> None:
             if pipc_root is not None:
                 os.environ["PIPC"] = str(pipc_root)
                 break
+
+
+def _initialize_pythonnet_runtime() -> Any:
+    """Initialize pythonnet runtime as netfx regardless of shell/system configuration."""
+    try:
+        import pythonnet  # type: ignore
+        from pythonnet import get_runtime_info, load
+    except ImportError as exc:  # pragma: no cover
+        raise PIDataError("PI AF SDKの利用には `pythonnet` が必要です。") from exc
+
+    set_runtime = getattr(pythonnet, "set_runtime", None)
+
+    runtime_info: Any = None
+    try:
+        runtime_info = get_runtime_info()
+    except Exception:
+        runtime_info = None
+
+    runtime_name = _runtime_name(runtime_info)
+    if runtime_name == FORCED_PYTHONNET_RUNTIME:
+        return runtime_info
+
+    if runtime_info is not None and runtime_name and runtime_name != FORCED_PYTHONNET_RUNTIME:
+        raise PIDataError(
+            "pythonnet runtime が既に netfx 以外で初期化されています。"
+            f" 現在: {runtime_info}. プロセス起動直後に DataStitcher のみを実行してください。"
+        )
+
+    if callable(set_runtime):
+        try:
+            from clr_loader import get_netfx  # type: ignore
+
+            set_runtime(get_netfx())
+        except Exception:
+            pass
+
+    try:
+        load(FORCED_PYTHONNET_RUNTIME)
+    except Exception:
+        try:
+            runtime_info = get_runtime_info()
+        except Exception:
+            runtime_info = None
+
+        runtime_name = _runtime_name(runtime_info)
+        if runtime_name != FORCED_PYTHONNET_RUNTIME:
+            raise PIDataError(
+                "pythonnet runtime の初期化に失敗しました。"
+                f" 要求runtime={FORCED_PYTHONNET_RUNTIME}, 現在={runtime_info}"
+            )
+
+    try:
+        runtime_info = get_runtime_info()
+    except Exception:
+        runtime_info = f"{FORCED_PYTHONNET_RUNTIME} (runtime info unavailable)"
+
+    return runtime_info
 
 
 def _import_afsdk_symbol(
@@ -473,11 +533,13 @@ def _run_fetch_in_netfx_subprocess(config: PIQueryConfig) -> pd.DataFrame:
         )
 
     payload_json = json.dumps(_config_to_payload(config), ensure_ascii=False)
+    project_root = str(Path(__file__).resolve().parents[1])
     runner = (
         "import json\n"
         "import sys\n"
         "import traceback\n"
         "from pathlib import Path\n"
+        "sys.path.insert(0, sys.argv[4])\n"
         "from src.pi_af_sdk import _config_from_payload, _fetch_pi_datalink_table_in_process\n"
         "payload = json.loads(sys.argv[1])\n"
         "out_path = Path(sys.argv[2])\n"
@@ -497,11 +559,11 @@ def _run_fetch_in_netfx_subprocess(config: PIQueryConfig) -> pd.DataFrame:
         err_path = Path(tmp_dir) / "pi_error.json"
 
         env = os.environ.copy()
-        env["PYTHONNET_RUNTIME"] = "netfx"
+        env["PYTHONNET_RUNTIME"] = FORCED_PYTHONNET_RUNTIME
         env["DATASTITCHER_PI_NETFX_CHILD"] = "1"
 
         proc = subprocess.run(
-            [python_exe, "-c", runner, payload_json, str(out_path), str(err_path)],
+            [python_exe, "-c", runner, payload_json, str(out_path), str(err_path), project_root],
             capture_output=True,
             text=True,
             env=env,
@@ -528,41 +590,14 @@ def _run_fetch_in_netfx_subprocess(config: PIQueryConfig) -> pd.DataFrame:
 def _load_af_sdk() -> dict[str, Any]:
     """Load AF SDK types through pythonnet with netfx and path fallback."""
     _prepare_afsdk_environment()
-
-    try:
-        from pythonnet import get_runtime_info, load
-    except ImportError as exc:  # pragma: no cover
-        raise PIDataError("PI AF SDKの利用には `pythonnet` が必要です。") from exc
-
-    runtime_info: Any = None
-    try:
-        runtime_info = get_runtime_info()
-    except Exception:
-        runtime_info = None
-
-    if runtime_info is None:
-        try:
-            load("netfx")
-        except Exception as exc:  # pragma: no cover
-            raise PIDataError(
-                "pythonnet runtime の初期化に失敗しました。`netfx` (.NET Framework) で実行できる環境か確認してください。"
-                f" 詳細: {type(exc).__name__}: {exc}"
-            ) from exc
-        try:
-            runtime_info = get_runtime_info()
-        except Exception:
-            runtime_info = "netfx (runtime info unavailable)"
+    runtime_info = _initialize_pythonnet_runtime()
 
     runtime_name = _runtime_name(runtime_info)
-    if runtime_name and runtime_name != "netfx":
-        # Runtime is already initialized with non-netfx in this process.
-        # We keep going and attempt AFSDK loading anyway to avoid hard-failing here.
-        try:
-            load("netfx")
-            runtime_info = get_runtime_info()
-            runtime_name = _runtime_name(runtime_info)
-        except Exception:
-            pass
+    if runtime_name and runtime_name != FORCED_PYTHONNET_RUNTIME:
+        raise PIDataError(
+            "pythonnet runtime が netfx ではありません。"
+            f" 現在: {runtime_info}"
+        )
 
     try:
         import clr  # type: ignore
@@ -757,10 +792,20 @@ def _resolve_af_database(af_server: Any, database_name: str) -> Any:
     if databases is None:
         raise PIDataError("AFサーバーからデータベース一覧を取得できません。")
 
-    try:
-        return _collection_get_item_by_name(databases, normalized_database_name, label="AFデータベース")
-    except Exception as exc:
-        raise PIDataError(f"AFデータベースが見つかりません: {normalized_database_name}") from exc
+    candidates = [normalized_database_name]
+    parts = [part for part in normalized_database_name.replace("/", "\\").split("\\") if _normalize_user_text(part)]
+    if parts:
+        last_name = _normalize_user_text(parts[-1])
+        if last_name and not any(_same_name(last_name, item) for item in candidates):
+            candidates.append(last_name)
+
+    for candidate in candidates:
+        try:
+            return _collection_get_item_by_name(databases, candidate, label="AFデータベース")
+        except Exception:
+            continue
+
+    raise PIDataError(f"AFデータベースが見つかりません: {normalized_database_name}")
 
 
 def _resolve_af_element(af_database: Any, element_name: str, sdk: dict[str, Any]) -> Any:
@@ -772,39 +817,52 @@ def _resolve_af_element(af_database: Any, element_name: str, sdk: dict[str, Any]
     AFElement = sdk["AFElement"]
     AFElementSearch = sdk["AFElementSearch"]
 
-    # 参照コードと同じく、A\B\C の階層パスは get_Item で順に辿る。
+    candidate_paths: list[str] = []
     candidate_path = normalized_element_name.replace("/", "\\")
-    path_parts = [part for part in candidate_path.split("\\") if _normalize_user_text(part)]
-    if path_parts:
-        database_name = _normalize_user_text(getattr(af_database, "Name", ""))
-        if database_name and _same_name(path_parts[0], database_name):
-            path_parts = path_parts[1:]
+    if candidate_path:
+        candidate_paths.append(candidate_path)
+    if normalized_element_name not in candidate_paths:
+        candidate_paths.append(normalized_element_name)
+
+    base_parts = [part for part in candidate_path.split("\\") if _normalize_user_text(part)]
+    database_name = _normalize_user_text(getattr(af_database, "Name", ""))
+    if base_parts and database_name and _same_name(base_parts[0], database_name):
+        trimmed = base_parts[1:]
+        if trimmed:
+            trimmed_path = "\\".join(trimmed)
+            if trimmed_path not in candidate_paths:
+                candidate_paths.append(trimmed_path)
+            last_name = _normalize_user_text(trimmed[-1])
+            if last_name and last_name not in candidate_paths:
+                candidate_paths.append(last_name)
+    elif base_parts:
+        last_name = _normalize_user_text(base_parts[-1])
+        if last_name and last_name not in candidate_paths:
+            candidate_paths.append(last_name)
 
     elements = getattr(af_database, "Elements", None)
-    if elements is not None and path_parts:
-        try:
-            element = _collection_get_item_by_name(elements, path_parts[0], label="AFルートエレメント")
-            for child_name in path_parts[1:]:
-                child_elements = getattr(element, "Elements", None)
-                if child_elements is None:
-                    raise PIDataError(f"AF子エレメントを取得できません: {child_name}")
-                element = _collection_get_item_by_name(child_elements, child_name, label="AF子エレメント")
-            return element
-        except Exception:
-            pass
+    for candidate in candidate_paths:
+        path_parts = [part for part in candidate.replace("/", "\\").split("\\") if _normalize_user_text(part)]
+        if elements is not None and path_parts:
+            try:
+                element = _collection_get_item_by_name(elements, path_parts[0], label="AFルートエレメント")
+                for child_name in path_parts[1:]:
+                    child_elements = getattr(element, "Elements", None)
+                    if child_elements is None:
+                        raise PIDataError(f"AF子エレメントを取得できません: {child_name}")
+                    element = _collection_get_item_by_name(child_elements, child_name, label="AF子エレメント")
+                return element
+            except Exception:
+                pass
 
-    candidate_names: list[str] = [normalized_element_name]
-    if candidate_path not in candidate_names:
-        candidate_names.append(candidate_path)
-
-    for candidate in candidate_names:
+    for candidate in candidate_paths:
         try:
             return AFElement.FindElement(af_database, candidate)
         except Exception:
             pass
 
     if elements is not None:
-        for candidate in candidate_names:
+        for candidate in candidate_paths:
             try:
                 return _collection_get_item_by_name(elements, candidate, label="AFエレメント")
             except Exception:
@@ -1436,7 +1494,7 @@ def fetch_pi_datalink_table(config: PIQueryConfig) -> pd.DataFrame:
     _validate_query_config(config)
 
     runtime_name = _runtime_name_from_pythonnet()
-    if runtime_name and runtime_name != "netfx" and os.environ.get("DATASTITCHER_PI_NETFX_CHILD") != "1":
+    if runtime_name and runtime_name != FORCED_PYTHONNET_RUNTIME and os.environ.get("DATASTITCHER_PI_NETFX_CHILD") != "1":
         return _run_fetch_in_netfx_subprocess(config)
 
     return _fetch_pi_datalink_table_in_process(config)

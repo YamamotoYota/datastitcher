@@ -43,6 +43,7 @@ from .profile import profile_dataframe
 from .recipe import build_recipe, recipe_from_json, recipe_to_json
 from .report import EXCEL_MAX_ROWS, append_execution_log, dataframe_to_csv_bytes, dataframe_to_excel_bytes
 from .right_aggregation import SUPPORTED_RIGHT_PRE_AGG_METHODS
+from .server_cache import clear_app_run_cache, load_dataframe as load_cached_dataframe, store_dataframe
 from .source_catalog import (
     PI_SOURCE_KINDS,
     SOURCE_ADD_BUTTON_SPECS,
@@ -61,9 +62,12 @@ from .source_loader import (
     list_sql_tables_from_options,
     load_table_from_source,
 )
+from .table_backend import normalize_table_page_size, slice_table_page
 
 PREVIEW_ROWS_DEFAULT = 100
 PREVIEW_PLAN_ROWS = 200
+RESULT_PAGE_SIZE_DEFAULT = 200
+INLINE_DOWNLOAD_ROW_THRESHOLD = 50_000
 LOG_PATH = Path("logs") / "execution_log.jsonl"
 
 CSV_ENCODING_OPTIONS = ["auto", "utf-8", "utf-8-sig", "cp932", "shift_jis", "latin1"]
@@ -138,6 +142,7 @@ def _ensure_source_options_defaults(cfg: TableConfig) -> TableConfig:
 def init_session_state() -> None:
     """Initialize all app session state keys used by the UI."""
     defaults: dict[str, Any] = {
+        "app_run_id": uuid.uuid4().hex,
         "table_configs": {},
         "join_plan": {"base_table_id": "", "row_explosion_warn_ratio": 10.0, "steps": []},
         "output_settings": {
@@ -153,6 +158,108 @@ def init_session_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+
+def _current_app_run_id() -> str:
+    """Return the current Streamlit session cache namespace."""
+    return str(st.session_state.get("app_run_id") or "")
+
+
+def _load_dataframe_from_cache(cache_key: str, label: str) -> pd.DataFrame:
+    """Load dataframe from process-local cache with user-friendly error."""
+    try:
+        return load_cached_dataframe(cache_key)
+    except KeyError as exc:
+        raise UserInputError(
+            f"{label} のサーバー側データキャッシュが失われました。もう一度処理を実行してください。"
+        ) from exc
+
+
+def _store_execution_payload(execution_result: Any, executed_at: str) -> dict[str, Any]:
+    """Store large execution dataframes in process-local cache and return a lightweight payload."""
+    app_run_id = _current_app_run_id()
+    clear_app_run_cache(app_run_id)
+
+    payload: dict[str, Any] = {
+        "executed_at": executed_at,
+        "final_df_cache_key": store_dataframe(execution_result.final_df, app_run_id, slot="execution-final"),
+        "final_shape": (int(execution_result.final_df.shape[0]), int(execution_result.final_df.shape[1])),
+        "step_results": [],
+    }
+
+    step_payloads: list[dict[str, Any]] = []
+    for index, step_result in enumerate(execution_result.step_results):
+        step_payloads.append(
+            {
+                "step": step_result.step,
+                "report": step_result.report,
+                "unmatched_left_cache_key": store_dataframe(
+                    step_result.unmatched_left_df,
+                    app_run_id,
+                    slot=f"step-{index + 1}-left-unmatched",
+                ),
+                "unmatched_right_cache_key": store_dataframe(
+                    step_result.unmatched_right_df,
+                    app_run_id,
+                    slot=f"step-{index + 1}-right-unmatched",
+                ),
+            }
+        )
+
+    payload["step_results"] = step_payloads
+    return payload
+
+
+def _render_paged_dataframe(
+    df: pd.DataFrame,
+    *,
+    state_prefix: str,
+    height: int,
+    default_page_size: int,
+    caption_prefix: str,
+) -> None:
+    """Render a dataframe page with page-size/page-number controls."""
+    page_size_key = f"{state_prefix}_page_size"
+    page_number_key = f"{state_prefix}_page_number"
+
+    if page_size_key not in st.session_state:
+        st.session_state[page_size_key] = normalize_table_page_size(default_page_size)
+    st.session_state[page_size_key] = normalize_table_page_size(st.session_state[page_size_key])
+    page_size = int(
+        st.number_input(
+            "表示件数/ページ",
+            min_value=10,
+            max_value=1000,
+            step=10,
+            key=page_size_key,
+        )
+    )
+
+    _, raw_page_count = slice_table_page(df, 0, page_size)
+    page_count = max(1, raw_page_count)
+
+    if page_number_key not in st.session_state:
+        st.session_state[page_number_key] = 1
+    current_page_number = max(1, min(int(st.session_state[page_number_key]), page_count))
+    st.session_state[page_number_key] = current_page_number
+    page_number = int(
+        st.number_input(
+            "ページ",
+            min_value=1,
+            max_value=page_count,
+            step=1,
+            key=page_number_key,
+        )
+    )
+
+    page_df, _ = slice_table_page(df, page_number - 1, page_size)
+    start_row = ((page_number - 1) * page_size) + 1 if len(df) else 0
+    end_row = start_row + len(page_df) - 1 if len(page_df) else 0
+    st.caption(
+        f"{caption_prefix}: {start_row:,} - {end_row:,} / {len(df):,} 行 "
+        f"(page {page_number:,}/{page_count:,}, page_size={page_size:,})"
+    )
+    st.dataframe(page_df, use_container_width=True, height=height)
 
 
 def _table_kind_from_filename(name: str) -> str:
@@ -1499,16 +1606,14 @@ def _execute_plan(uploaded_map: dict[str, dict[str, Any]]) -> None:
     join_plan = _get_join_plan_model()
     recipe = _current_recipe()
     load_cache: dict[str, pd.DataFrame] = {}
+    executed_at = datetime.now(timezone.utc).isoformat()
 
     def loader(table_id: str) -> pd.DataFrame:
         return _load_table_for_execution(table_id, uploaded_map, load_cache)
 
     execution_result = execute_join_plan(join_plan=join_plan, load_table=loader, engine=PandasEquiJoinEngine())
 
-    st.session_state["last_execution"] = {
-        "executed_at": datetime.now(timezone.utc).isoformat(),
-        "result": execution_result,
-    }
+    st.session_state["last_execution"] = _store_execution_payload(execution_result, executed_at)
 
     input_files = []
     for table_id, raw_cfg in st.session_state["table_configs"].items():
@@ -1528,7 +1633,7 @@ def _execute_plan(uploaded_map: dict[str, dict[str, Any]]) -> None:
         )
 
     log_entry = ExecutionLogEntry(
-        executed_at=datetime.now(timezone.utc).isoformat(),
+        executed_at=executed_at,
         recipe_version=recipe.version,
         input_files=input_files,
         base_table_id=join_plan.base_table_id,
@@ -1539,10 +1644,10 @@ def _execute_plan(uploaded_map: dict[str, dict[str, Any]]) -> None:
     append_execution_log(log_entry, LOG_PATH)
 
 
-def _render_step_report(step_result: Any, step_index: int) -> None:
+def _render_step_report(step_payload: dict[str, Any], step_index: int) -> None:
     """Render one step report and unmatched downloads."""
-    report = step_result.report
-    step = step_result.step
+    report = step_payload["report"]
+    step = step_payload["step"]
 
     st.markdown(
         f"**手順 {step_index+1}**: 種別=`{getattr(step, 'operation', 'join')}` / "
@@ -1607,11 +1712,21 @@ def _render_step_report(step_result: Any, step_index: int) -> None:
 
     st.markdown("未マッチ抽出")
     dl1, dl2 = st.columns(2)
-    left_unmatched = step_result.unmatched_left_df
-    right_unmatched = step_result.unmatched_right_df
+    try:
+        left_unmatched = _load_dataframe_from_cache(step_payload["unmatched_left_cache_key"], "左未マッチ結果")
+        right_unmatched = _load_dataframe_from_cache(step_payload["unmatched_right_cache_key"], "右未マッチ結果")
+    except DataStitcherError as exc:
+        st.error(f"未マッチ結果の表示に失敗しました: {exc}")
+        return
     with dl1:
         st.caption(f"左未マッチ: {left_unmatched.shape[0]} 行")
-        st.dataframe(left_unmatched.head(100), use_container_width=True, height=220)
+        _render_paged_dataframe(
+            left_unmatched,
+            state_prefix=f"step_{step_index}_left_unmatched",
+            height=220,
+            default_page_size=min(100, max(10, int(st.session_state.get("preview_rows", PREVIEW_ROWS_DEFAULT)))),
+            caption_prefix="左未マッチ表示範囲",
+        )
         st.download_button(
             "左未マッチCSV",
             data=dataframe_to_csv_bytes(left_unmatched, encoding="utf-8-sig"),
@@ -1622,7 +1737,13 @@ def _render_step_report(step_result: Any, step_index: int) -> None:
         )
     with dl2:
         st.caption(f"右未マッチ: {right_unmatched.shape[0]} 行")
-        st.dataframe(right_unmatched.head(100), use_container_width=True, height=220)
+        _render_paged_dataframe(
+            right_unmatched,
+            state_prefix=f"step_{step_index}_right_unmatched",
+            height=220,
+            default_page_size=min(100, max(10, int(st.session_state.get("preview_rows", PREVIEW_ROWS_DEFAULT)))),
+            caption_prefix="右未マッチ表示範囲",
+        )
         st.download_button(
             "右未マッチCSV",
             data=dataframe_to_csv_bytes(right_unmatched, encoding="utf-8-sig"),
@@ -1640,15 +1761,23 @@ def _render_execution_result() -> None:
         st.info("処理を実行すると、最終結果と品質指標をここに表示します。")
         return
 
-    execution_result = payload["result"]
-    final_df: pd.DataFrame = execution_result.final_df
+    try:
+        final_df = _load_dataframe_from_cache(payload["final_df_cache_key"], "最終結果")
+    except Exception as exc:
+        if isinstance(exc, DataStitcherError):
+            st.error(f"結果表示エラー: {exc}")
+        else:
+            _show_exception("結果表示エラー", exc if isinstance(exc, Exception) else Exception(str(exc)))
+        return
+
     output_settings = _get_output_settings_model()
 
     st.subheader("最終結果")
-    st.caption("全手順を適用した最終テーブルです。内容確認後に CSV または Excel で保存できます。")
+    st.caption("全手順を適用した最終テーブルです。大きい結果はページ単位で表示します。")
+    final_shape = payload.get("final_shape", (int(final_df.shape[0]), int(final_df.shape[1])))
     m1, m2, m3 = st.columns(3)
-    m1.metric("行数", int(final_df.shape[0]))
-    m2.metric("列数", int(final_df.shape[1]))
+    m1.metric("行数", int(final_shape[0]))
+    m2.metric("列数", int(final_shape[1]))
     m3.metric("実行時刻", payload.get("executed_at", "-"))
 
     if len(final_df) > EXCEL_MAX_ROWS:
@@ -1656,42 +1785,80 @@ def _render_execution_result() -> None:
             f"Excelの1シート上限 ({EXCEL_MAX_ROWS:,} 行) を超えています。CSV出力を推奨します。"
         )
 
-    preview_rows = int(st.session_state["preview_rows"])
-    st.caption(f"最終結果プレビュー（先頭 {preview_rows} 行）")
-    st.dataframe(final_df.head(preview_rows), use_container_width=True, height=360)
+    _render_paged_dataframe(
+        final_df,
+        state_prefix="final_result",
+        height=360,
+        default_page_size=min(
+            RESULT_PAGE_SIZE_DEFAULT,
+            max(10, int(st.session_state.get("preview_rows", PREVIEW_ROWS_DEFAULT))),
+        ),
+        caption_prefix="最終結果表示範囲",
+    )
 
-    csv_bytes = dataframe_to_csv_bytes(final_df, encoding=output_settings.csv_encoding)
-    excel_bytes = dataframe_to_excel_bytes(final_df, sheet_name=output_settings.excel_sheet_name)
+    preferred_format = output_settings.default_format if output_settings.default_format in {"csv", "excel"} else "csv"
+    render_both_formats = len(final_df) <= INLINE_DOWNLOAD_ROW_THRESHOLD
 
-    dlc1, dlc2 = st.columns(2)
-    with dlc1:
-        st.download_button(
-            "CSVダウンロード",
-            data=csv_bytes,
-            file_name="datastitcher_result.csv",
-            mime="text/csv",
-            key="download_final_csv",
-            use_container_width=True,
+    if render_both_formats:
+        csv_bytes = dataframe_to_csv_bytes(final_df, encoding=output_settings.csv_encoding)
+        excel_bytes = dataframe_to_excel_bytes(final_df, sheet_name=output_settings.excel_sheet_name)
+
+        dlc1, dlc2 = st.columns(2)
+        with dlc1:
+            st.download_button(
+                "CSVダウンロード",
+                data=csv_bytes,
+                file_name="datastitcher_result.csv",
+                mime="text/csv",
+                key="download_final_csv",
+                use_container_width=True,
+            )
+        with dlc2:
+            st.download_button(
+                "Excelダウンロード (1シート)",
+                data=excel_bytes,
+                file_name="datastitcher_result.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_final_excel",
+                use_container_width=True,
+            )
+    else:
+        st.info(
+            "大規模結果のため、ダウンロードデータの都度生成を抑えるために "
+            "サイドバーで選択した既定出力形式のみ表示します。"
         )
-    with dlc2:
-        st.download_button(
-            "Excelダウンロード (1シート)",
-            data=excel_bytes,
-            file_name="datastitcher_result.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            key="download_final_excel",
-            use_container_width=True,
-        )
+        if preferred_format == "excel" and len(final_df) > EXCEL_MAX_ROWS:
+            preferred_format = "csv"
+
+        if preferred_format == "excel":
+            st.download_button(
+                "Excelダウンロード (1シート)",
+                data=dataframe_to_excel_bytes(final_df, sheet_name=output_settings.excel_sheet_name),
+                file_name="datastitcher_result.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="download_final_excel_large",
+                use_container_width=True,
+            )
+        else:
+            st.download_button(
+                "CSVダウンロード",
+                data=dataframe_to_csv_bytes(final_df, encoding=output_settings.csv_encoding),
+                file_name="datastitcher_result.csv",
+                mime="text/csv",
+                key="download_final_csv_large",
+                use_container_width=True,
+            )
 
     st.subheader("ステップ品質指標（結合・縦連結）")
-    if not execution_result.step_results:
+    step_payloads = list(payload.get("step_results", []))
+    if not step_payloads:
         st.info("ステップがないため、ベーステーブルをそのまま出力しています。")
         return
 
-    tabs = st.tabs([f"手順 {i+1}" for i in range(len(execution_result.step_results))])
-    for i, (tab, step_result) in enumerate(zip(tabs, execution_result.step_results)):
+    tabs = st.tabs([f"手順 {i+1}" for i in range(len(step_payloads))])
+    for i, (tab, step_payload) in enumerate(zip(tabs, step_payloads)):
         with tab:
-            _render_step_report(step_result, i)
+            _render_step_report(step_payload, i)
 
 
 def run() -> None:

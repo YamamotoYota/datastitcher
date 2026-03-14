@@ -8,8 +8,10 @@ from __future__ import annotations
 import importlib.util
 import sqlite3
 
+import pandas as pd
 import pytest
 
+from src import source_loader
 from src.models import TableConfig
 from src.source_loader import (
     build_sql_sample_query_from_options,
@@ -58,3 +60,39 @@ def test_sqlite_table_list_and_query_preview(tmp_path) -> None:
     assert df["id"].tolist() == [1, 2]
     assert df["customer"].tolist() == ["A", "B"]
 
+
+def test_pi_preview_limit_caps_max_rows_per_tag(monkeypatch) -> None:
+    captured: dict[str, int] = {}
+
+    def fake_fetch(config):
+        captured["max_rows_per_tag"] = int(config.max_rows_per_tag)
+        return pd.DataFrame(
+            {
+                "timestamp": pd.to_datetime(["2026-01-01 00:00:00", "2026-01-01 01:00:00"]),
+                "sinusoid": [1.0, 2.0],
+            }
+        )
+
+    monkeypatch.setattr(source_loader, "fetch_pi_datalink_table", fake_fetch)
+
+    cfg = TableConfig(
+        table_id="pi_1",
+        table_name="pi_table",
+        source_file_name="pi_da_tag",
+        source_kind="pi_da_tag",
+        source_options={
+            "pi_server": "PISRV01",
+            "query_type": "recorded",
+            "tags_text": "sinusoid",
+            "start_time": "*-1d",
+            "end_time": "*",
+            "interval": "1h",
+            "summary_functions": ["average"],
+            "max_rows_per_tag": 10000,
+        },
+    )
+
+    df = load_table_from_source(cfg, nrows=25)
+
+    assert captured["max_rows_per_tag"] == 25
+    assert df.shape == (2, 2)

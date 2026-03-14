@@ -8,17 +8,23 @@ CSV / Excel / SQL / PI データを 1 つのテーブルにまとめ、CSV ま�
 このリポジトリは、以下の環境を前提にしています。
 
 - OS: Windows
-- Python: Miniforge で作成した `datastitcher` 環境
 - Python バージョン: 3.11 以上
-- パッケージ導入方法:
-  - Python は `conda` で導入
-  - アプリ依存ライブラリは `pip install -r requirements.txt`
+- 仮想環境: `venv` / `conda` のどちらでも可
+- アプリ依存ライブラリ: `pip install -r requirements.txt`
+- ビルド依存ライブラリ: `pip install -r requirements-build.txt`
 
 SQL や PI を使う場合は、別途ドライバや PI AF Client / AF SDK が必要です。
 
 ## セットアップ
 
-### 1. Miniforge 環境を作成
+### 1. 仮想環境を用意
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+```
+
+`conda` を使う場合は、以下でも構いません。
 
 ```powershell
 conda create -n datastitcher python=3.11
@@ -34,8 +40,7 @@ pip install -r requirements.txt
 ## アプリの起動
 
 ```powershell
-conda activate datastitcher
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 起動後はブラウザで `http://localhost:8501` を開きます。
@@ -50,22 +55,31 @@ powershell -ExecutionPolicy Bypass -File .\build_exe.ps1
 
 `build_exe.ps1` は次のどちらでも動くようにしてあります。
 
-- `conda activate datastitcher` 済みの PowerShell から実行
-- `conda` コマンドが利用できる状態で、未アクティブのまま実行
+- `-PythonExe` で明示指定した Python から実行
+- アクティブな `venv` / `conda` 環境の `python` から実行
+- `python` または `py -3` が利用できる状態で実行
+- `conda` コマンドが利用できる場合は `conda run -n datastitcher` にフォールバック
 
 また、現在のカレントディレクトリに依存せず、スクリプト配置フォルダを基準にビルドします。
 
 このスクリプトは以下を行います。
 
-1. 実行中の PowerShell から `datastitcher` 環境を特定
-2. 必要ならその環境に `pyinstaller` を導入・更新
-3. `DataStitcher.spec` を使ってビルド
-4. GitHub にそのまま push できる `dist\DataStitcher` 配下の実行ファイル一式を更新
+1. 利用可能な Python 3.11 以上を解決
+2. アプリ依存が入っているかを確認
+3. `requirements-build.txt` に基づいて build 依存を導入
+4. `DataStitcher.spec` を使ってビルド
+5. `dist\DataStitcher` 配下の実行ファイル一式を更新
+
+ビルドに使う Python を明示したい場合:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_exe.ps1 -PythonExe C:\path\to\python.exe
+```
 
 ### 直接 PyInstaller を使う場合
 
 ```powershell
-conda activate datastitcher
+pip install -r requirements-build.txt
 python -m PyInstaller --noconfirm --clean .\DataStitcher.spec
 ```
 
@@ -192,7 +206,6 @@ sum_vw / sum_w
 ## テスト
 
 ```powershell
-conda activate datastitcher
 pytest -q
 ```
 
@@ -211,6 +224,7 @@ pytest -q
 ```text
 app.py
 build_exe.ps1
+requirements-build.txt
 DataStitcher.spec
 launcher_datastitcher.py
 src/
@@ -233,6 +247,7 @@ src/
   source_loader.py
   streamlit_app.py
 tests/
+  conftest.py
 data/
 dist/
 logs/
@@ -281,6 +296,7 @@ logs/
 - `dist\DataStitcher` フォルダ一式が揃っているか確認してください
 - `DataStitcher.exe` を単体で移動していないか確認してください
 - アクセス先は通常 `http://localhost:8501` です。`8501` が使用中なら `8502`, `8503` のように自動で空きポートへ切り替わります
+- ビルドし直す場合は、必要に応じて `build_exe.ps1 -PythonExe <python.exe>` で使用 Python を明示してください
 - `http://localhost:3000` が表示される場合は古い実行ファイルです。最新版で `build_exe.ps1` を実行して `dist\DataStitcher` を作り直してください
 - 実行ログに `Serving static content from the Node dev server` と出る場合も同様に古い実行ファイルです
 

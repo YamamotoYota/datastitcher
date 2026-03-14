@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pandas as pd
@@ -22,7 +23,7 @@ from .errors import UserInputError
 from .io_utils import load_table as load_file_table
 from .io_utils import prepare_table
 from .models import TableConfig
-from .pi_af_sdk import PIDataError, build_pi_query_config, fetch_pi_datalink_table
+from .pi_af_sdk import PIDataError, PIQueryConfig, build_pi_query_config, fetch_pi_datalink_table
 from .source_catalog import FILE_SOURCE_KINDS, PI_SOURCE_KINDS, SQL_SOURCE_KIND
 
 
@@ -97,6 +98,16 @@ def build_pi_query_kwargs_from_source_options(source_kind: str, options: dict[st
     }
 
 
+def _apply_preview_row_limit_to_pi_config(config: PIQueryConfig, nrows: int | None) -> PIQueryConfig:
+    """Cap PI retrieval volume during preview loads."""
+    if nrows is None:
+        return config
+    preview_limit = max(1, int(nrows))
+    if int(config.max_rows_per_tag) <= preview_limit:
+        return config
+    return replace(config, max_rows_per_tag=preview_limit)
+
+
 def load_table_from_source(
     table: TableConfig,
     *,
@@ -128,6 +139,7 @@ def load_table_from_source(
         options = dict(table.source_options or {})
         try:
             config = build_pi_query_config(**build_pi_query_kwargs_from_source_options(source_kind, options))
+            config = _apply_preview_row_limit_to_pi_config(config, nrows)
             raw = fetch_pi_datalink_table(config)
         except PIDataError as exc:
             raise UserInputError(str(exc)) from exc

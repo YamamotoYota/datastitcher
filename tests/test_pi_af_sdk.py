@@ -12,8 +12,12 @@ from src.pi_af_sdk import (
     _collect_attribute_snapshot,
     _create_search_object,
     _extract_event_frame_element_name,
+    _resolve_af_database,
+    _resolve_af_element,
     build_pi_query_config,
+    normalize_summary_functions,
     parse_name_list,
+    parse_tag_list,
 )
 
 
@@ -61,6 +65,55 @@ class _FakeTwoArgSearch:
     def __init__(self, database: object, query: str) -> None:
         self.database = database
         self.query = query
+
+
+class _FakeCollection:
+    def __init__(self, items: list[object]) -> None:
+        self._items = items
+
+    def __iter__(self):
+        return iter(self._items)
+
+
+class _FakeElement:
+    def __init__(self, name: str, children: list[object] | None = None) -> None:
+        self.Name = name
+        self.Elements = _FakeCollection(children or [])
+
+
+class _FakeDatabase:
+    def __init__(self, name: str, elements: list[object]) -> None:
+        self.Name = name
+        self.Elements = _FakeCollection(elements)
+
+
+class _FakeServer:
+    def __init__(self, databases: list[object]) -> None:
+        self.Databases = _FakeCollection(databases)
+
+
+class _FakeAFElementApi:
+    @staticmethod
+    def FindElement(database: object, candidate: str) -> None:
+        raise RuntimeError(candidate)
+
+
+class _UnusedSearch:
+    def __init__(self, *args: object) -> None:
+        raise RuntimeError(args)
+
+
+def test_parse_tag_list_alias() -> None:
+    tags = parse_tag_list("sinusoid\ncdt158")
+    assert tags == ("sinusoid", "cdt158")
+
+
+def test_normalize_summary_functions_fallback() -> None:
+    values = normalize_summary_functions(["unknown", "max"])
+    assert values == ("max",)
+
+    fallback = normalize_summary_functions([])
+    assert fallback == ("average", "min", "max")
 
 
 def test_parse_name_list_accepts_japanese_delimiters_and_nfkc() -> None:
@@ -127,3 +180,26 @@ def test_create_search_object_accepts_constructor_fallback() -> None:
     )
     assert isinstance(search, _FakeTwoArgSearch)
     assert search.query == "query"
+
+
+def test_resolve_af_database_accepts_path_like_name() -> None:
+    target_db = _FakeDatabase("設備DB", [])
+    server = _FakeServer([target_db])
+
+    resolved = _resolve_af_database(server, "工場AF/設備DB")
+
+    assert resolved is target_db
+
+
+def test_resolve_af_element_accepts_database_prefixed_path() -> None:
+    target_element = _FakeElement("装置A")
+    root_element = _FakeElement("ライン1", children=[target_element])
+    database = _FakeDatabase("設備DB", [root_element])
+
+    resolved = _resolve_af_element(
+        database,
+        "設備DB\\ライン1\\装置A",
+        {"AFElement": _FakeAFElementApi, "AFElementSearch": _UnusedSearch},
+    )
+
+    assert resolved is target_element
